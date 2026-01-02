@@ -42,7 +42,7 @@ import { ExpressAdapter } from '@bull-board/express'
 
 declare global {
     namespace Express {
-        interface User extends LoggedInUser {}
+        interface User extends LoggedInUser { }
         interface Request {
             user?: LoggedInUser
         }
@@ -237,6 +237,8 @@ export class App {
             res.header('Access-Control-Allow-Credentials', 'true') // Allow credentials (cookies, etc.)
             if (next) next()
         })
+
+
 
         const denylistURLs = process.env.DENYLIST_URLS ? process.env.DENYLIST_URLS.split(',') : []
         const whitelistURLs = WHITELIST_URLS.filter((url) => !denylistURLs.includes(url))

@@ -39,10 +39,10 @@ const secureCookie =
     process.env.SECURE_COOKIES === 'false'
         ? false
         : process.env.SECURE_COOKIES === 'true'
-        ? true
-        : process.env.APP_URL?.startsWith('https')
-        ? true
-        : false
+            ? true
+            : process.env.APP_URL?.startsWith('https')
+                ? true
+                : false
 const jwtOptions = {
     secretOrKey: jwtAuthTokenSecret,
     audience: jwtAudience,

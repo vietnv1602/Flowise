@@ -41,6 +41,27 @@ const fetchVariables = async () => {
     }
 }
 
+const findSuggestionMatch = (config) => {
+    const { char, $position } = config
+    const text = $position.doc.textBetween($position.start(), $position.pos, '\n', '\0')
+    const escapedChar = char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const regex = new RegExp(`${escapedChar}([^\\s]*)$`)
+    const match = text.match(regex)
+
+    if (match) {
+        return {
+            range: {
+                from: $position.pos - match[0].length,
+                to: $position.pos
+            },
+            query: match[1],
+            text: match[0]
+        }
+    }
+
+    return null
+}
+
 export const suggestionOptions = (
     availableNodesForVariable,
     availableState,
@@ -50,6 +71,7 @@ export const suggestionOptions = (
     isNodeInsideInteration
 ) => ({
     char: '{{',
+    findSuggestionMatch: findSuggestionMatch,
     items: async ({ query }) => {
         const defaultItems = [
             { id: 'question', mentionLabel: 'question', description: "User's question from chatbox", category: 'Chat Context' },
