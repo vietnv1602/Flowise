@@ -127,5 +127,8 @@
                 }
             ]
         ]
+    },
+    "dependencies": {
+        "weaviate-client": "^3.10.0"
     }
 }

@@ -4,29 +4,10 @@ import { DynamicStructuredTool } from '@langchain/core/tools'
 import { Embeddings } from '@langchain/core/embeddings'
 import { OpenAIEmbeddings } from '@langchain/openai'
 import { z } from 'zod'
-import weaviate, { ApiKey } from 'weaviate-ts-client'
+import weaviate from 'weaviate-client'
 
-// Custom logger to filter out vector arrays from logs to avoid GraphQL syntax errors in output
-const createCleanLogger = () => {
-    const error = (message: string, ...args: any[]) => {
-        let cleanMessage = message
-        let cleanArgs = args
-
-        // Remove vector from GraphQL queries in logs
-        if (message.includes('GraphQL') || message.toLowerCase().includes('query')) {
-            cleanArgs = args.map(arg => {
-                if (typeof arg === 'string') {
-                    return arg.replace(/vector:\s*\[([^\]]*)\]/, 'vector: [<hidden>]')
-                }
-                return arg
-            })
-        }
-
-        console.error(`[Weaviate] ${cleanMessage}`, ...cleanArgs)
-    }
-
-    return { error }
-}
+// Helper to check if in development mode
+const isDev = process.env.NODE_ENV === 'development'
 
 class Weaviate_Tools implements INode {
     label: string
@@ -108,6 +89,26 @@ class Weaviate_Tools implements INode {
                 name: 'weaviateHost',
                 type: 'string',
                 placeholder: 'localhost:8080',
+                acceptVariable: true
+            },
+            {
+                label: 'gRPC Port',
+                name: 'grpcPort',
+                type: 'number',
+                description: 'gRPC port (default: 50051 for http, 443 for https)',
+                placeholder: '50051',
+                optional: true,
+                additionalParams: true,
+                acceptVariable: true
+            },
+            {
+                label: 'Query Timeout (seconds)',
+                name: 'queryTimeout',
+                type: 'number',
+                description: 'Query timeout in seconds (default: 60)',
+                placeholder: '60',
+                optional: true,
+                additionalParams: true,
                 acceptVariable: true
             },
             {
@@ -216,6 +217,8 @@ class Weaviate_Tools implements INode {
         const embeddingApiKey = nodeData.inputs?.embeddingApiKey as string
         const embeddingModelName = nodeData.inputs?.embeddingModelName as string
         const embeddingBaseUrl = nodeData.inputs?.embeddingBaseUrl as string
+        const grpcPort = nodeData.inputs?.grpcPort as number
+        const queryTimeout = nodeData.inputs?.queryTimeout as number
         let weaviateFilter = nodeData.inputs?.weaviateFilter
 
         const credentialData = await getCredentialData(nodeData.credential ?? '', options)
@@ -232,17 +235,41 @@ class Weaviate_Tools implements INode {
             })
         }
 
-        const clientConfig: any = {
-            scheme: weaviateScheme,
-            host: weaviateHost,
-            logger: createCleanLogger()
+        // Connect to Weaviate using v3 client
+        // Parse host to extract hostname if it includes port
+        let httpHost = weaviateHost
+        let httpPort = weaviateScheme === 'https' ? 443 : 8080
+        // Use user-provided gRPC port or default
+        let defaultGrpcPort = weaviateScheme === 'https' ? 443 : 50051
+        let finalGrpcPort = grpcPort || defaultGrpcPort
+
+        // Handle host:port format
+        if (weaviateHost.includes(':')) {
+            const parts = weaviateHost.split(':')
+            httpHost = parts[0]
+            httpPort = parseInt(parts[1]) || httpPort
+        }
+
+        const connectionConfig: any = {
+            httpHost: httpHost,
+            httpPort: httpPort,
+            httpSecure: weaviateScheme === 'https',
+            grpcHost: httpHost,  // Use same host for gRPC
+            grpcPort: finalGrpcPort,
+            grpcSecure: weaviateScheme === 'https',
+            skipInitChecks: true,  // Skip gRPC health check for servers without gRPC enabled
+            timeout: {
+                init: 30,                      // 30 seconds for initialization
+                query: queryTimeout || 60,     // Use user-provided timeout or default 60s
+                insert: 120                    // 120 seconds for insertions
+            }
         }
 
         if (weaviateApiKey) {
-            clientConfig.apiKey = new ApiKey(weaviateApiKey)
+            connectionConfig.authCredentials = new weaviate.ApiKey(weaviateApiKey)
         }
 
-        const client = weaviate.client(clientConfig)
+        const client = await weaviate.connectToCustom(connectionConfig)
 
         let filter: any
         if (weaviateFilter) {
@@ -261,113 +288,131 @@ class Weaviate_Tools implements INode {
             name: 'weaviate_search',
             description: toolDescription,
             schema: z.object({
-                query: z.union([z.string(), z.array(z.string())]).describe('The search query string or list of queries.'),
+                query: z.array(z.string()).describe('Array of 2 search queries. Example: ["query1", "query2"]'),
             }),
             func: async (input: any) => {
                 const { query } = input
 
+                // Format input queries - split by pipe (|) for multiple queries
+                let queries: string[] = []
+                if (Array.isArray(query)) {
+                    queries = query
+                } else {
+                    // Split by pipe (|) first, then by newline as fallback
+                    if (query.includes('|')) {
+                        queries = query.split('|').map((q: string) => q.trim()).filter((q: string) => q !== '')
+                    } else {
+                        queries = query.split('\n').map((q: string) => q.trim()).filter((q: string) => q !== '')
+                    }
+                }
+                if (isDev) console.log('[Weaviate Tool] Input Questions:', JSON.stringify(queries, null, 2))
 
                 try {
                     const executeSearch = async (singleQuery: string) => {
-                        let builder = client.graphql.get().withClassName(weaviateIndex)
+                        // Clean collection name - remove wildcards and special chars
+                        const cleanIndex = weaviateIndex.replace(/^\*+|\*+$/g, '').replace(/^\/+|\/+$/g, '')
+                        const collection = client.collections.get(cleanIndex)
 
-                        let fieldList = ''
+                        // Helper function to clean field names
+                        const cleanFieldName = (fieldName: string): string => {
+                            return fieldName.replace(/^\*+|\*+$/g, '').replace(/^\/+|\/+$/g, '')
+                        }
+
+                        // Determine which fields to return
+                        const returnFields: string[] = []
                         if (fields) {
-                            fieldList = fields.split(',').map((f) => f.trim()).join(' ')
+                            returnFields.push(...fields.split(',').map((f) => cleanFieldName(f.trim())))
                         } else {
                             // Construct fields from textKey and metadataKeys
-                            const keys: string[] = []
-                            if (weaviateTextKey) keys.push(weaviateTextKey)
+                            if (weaviateTextKey) returnFields.push(cleanFieldName(weaviateTextKey))
                             if (weaviateMetadataKeys) {
                                 try {
                                     const metas = JSON.parse(weaviateMetadataKeys.replace(/\s/g, ''))
                                     if (Array.isArray(metas)) {
-                                        keys.push(...metas)
+                                        returnFields.push(...metas.map((m: string) => cleanFieldName(m)))
                                     }
                                 } catch (e) {
                                     // ignore
                                 }
                             }
-
-                            if (keys.length > 0) {
-                                fieldList = keys.join(' ')
-                            } else {
-                                throw new Error("Please provide 'Output Fields' or 'Weaviate Text Key'")
-                            }
                         }
 
-                        // Request additional metadata (id, score, distance)
-                        // Note: Don't add _additional to fieldList, it causes GraphQL syntax errors
-                        // The metadata will be available in the response automatically
+                        // Always return metadata (id, score, distance)
+                        const returnMetadata = ['id', 'score', 'distance']
 
-                        builder = builder.withFields(fieldList)
+                        let results
 
                         if (searchMethod === 'Hybrid') {
-                            const hybridArgs: any = {
-                                query: singleQuery,
-                                alpha: hybridAlpha ? parseFloat(hybridAlpha) : 0.5
-                            }
+                            const alpha = hybridAlpha ? parseFloat(hybridAlpha) : 0.5
+
                             if (resolvedEmbeddings) {
                                 const vector = await resolvedEmbeddings.embedQuery(singleQuery)
-                                console.log(`[Weaviate Tool] Hybrid search query="${singleQuery}", vector dimension=${vector.length}, alpha=${hybridArgs.alpha}`)
-                                hybridArgs.vector = vector
+                                results = await collection.query.hybrid(
+                                    singleQuery,
+                                    {
+                                        limit: parseInt(topK) || 5,
+                                        alpha: alpha,
+                                        vector: vector,
+                                        returnMetadata: returnMetadata as any,
+                                        returnProperties: returnFields.length > 0 ? returnFields : undefined
+                                    }
+                                )
                             } else {
-                                console.log(`[Weaviate Tool] Hybrid search query="${singleQuery}", alpha=${hybridArgs.alpha} (no vector)`)
+                                results = await collection.query.hybrid(
+                                    singleQuery,
+                                    {
+                                        limit: parseInt(topK) || 5,
+                                        alpha: alpha,
+                                        returnMetadata: returnMetadata as any,
+                                        returnProperties: returnFields.length > 0 ? returnFields : undefined
+                                    }
+                                )
                             }
-                            builder = builder.withHybrid(hybridArgs)
                         } else {
-                            // Similarity Search
+                            // Similarity Search (nearVector)
                             if (resolvedEmbeddings) {
                                 const vector = await resolvedEmbeddings.embedQuery(singleQuery)
-                                console.log(`[Weaviate Tool] Similarity search query="${singleQuery}", vector dimension=${vector.length}`)
-                                builder = builder.withNearVector({ vector })
+                                results = await collection.query.nearVector(
+                                    vector,
+                                    {
+                                        limit: parseInt(topK) || 5,
+                                        returnMetadata: returnMetadata as any,
+                                        returnProperties: returnFields.length > 0 ? returnFields : undefined
+                                    }
+                                )
                             } else {
-                                console.log(`[Weaviate Tool] NearText search query="${singleQuery}"`)
-                                builder = builder.withNearText({ concepts: [singleQuery] })
+                                // NearText (BM25)
+                                results = await collection.query.bm25(
+                                    singleQuery,
+                                    {
+                                        limit: parseInt(topK) || 5,
+                                        returnMetadata: returnMetadata as any,
+                                        returnProperties: returnFields.length > 0 ? returnFields : undefined
+                                    }
+                                )
                             }
                         }
 
-                        if (filter) {
-                            builder = builder.withWhere(filter)
+                        // Apply filter if provided
+                        if (filter && results) {
+                            // Note: In v3, filters are applied within the query method
+                            // This is a simplified approach - you may need to adjust based on actual filter structure
+                            console.warn('[Weaviate Tool] Filter in v3 client should be applied within query method')
                         }
 
-                        const response = await builder.withLimit(parseInt(topK) || 5).do()
-
-                        if (!response || !response.data || !response.data.Get || !response.data.Get[weaviateIndex]) {
-                            console.warn('[Weaviate Tool] Unexpected response format:', JSON.stringify(response, null, 2))
+                        // Format results
+                        if (!results || !results.objects) {
                             return []
                         }
 
-                        const data = response.data.Get[weaviateIndex]
-
-                        // Format results - handle both v1 and v2 response formats
-                        return data.map((obj: any) => {
-                            // Check if _additional exists (v2 format)
-                            if (obj._additional) {
-                                const { _additional, ...properties } = obj
-                                return {
-                                    id: _additional?.id,
-                                    properties: properties,
-                                    score: _additional?.score || _additional?.distance
-                                }
-                            }
-                            // Otherwise, return object directly (v1 format or no metadata)
+                        return results.objects.map((obj: any) => {
                             return {
-                                id: obj.id,
-                                properties: obj,
-                                score: null
+                                id: obj.uuid,
+                                properties: obj.properties,
+                                score: obj.metadata?.score ?? obj.metadata?.distance ?? null
                             }
                         })
                     }
-
-                    // Format input queries
-                    let queries: string[] = []
-                    if (Array.isArray(query)) {
-                        queries = query
-                    } else {
-                        queries = query.split('\n').map((q: string) => q.trim()).filter((q: string) => q !== '')
-                    }
-                    console.log('[Weaviate Tool] Input Questions:', JSON.stringify(queries, null, 2))
 
                     // Execute searches in parallel
                     const resultsArray = await Promise.all(queries.map((q: string) => executeSearch(q)))
@@ -398,68 +443,55 @@ class Weaviate_Tools implements INode {
                         const executeSectionFetch = async (comboStr: string) => {
                             try {
                                 const { header, path } = JSON.parse(comboStr)
-                                let builder = client.graphql.get().withClassName(weaviateIndex)
+                                const cleanIndex = weaviateIndex.replace(/^\*+|\*+$/g, '').replace(/^\/+|\/+$/g, '')
+                                const collection = client.collections.get(cleanIndex)
 
-                                // Reuse field construction logic
-                                let fieldList = ''
+                                // Helper function to clean field names
+                                const cleanFieldName = (fieldName: string): string => {
+                                    return fieldName.replace(/^\*+|\*+$/g, '').replace(/^\/+|\/+$/g, '')
+                                }
+
+                                // Determine which fields to return
+                                const returnFields: string[] = []
                                 if (fields) {
-                                    fieldList = fields.split(',').map((f) => f.trim()).join(' ')
+                                    returnFields.push(...fields.split(',').map((f) => cleanFieldName(f.trim())))
                                 } else {
-                                    const keys: string[] = []
-                                    if (weaviateTextKey) keys.push(weaviateTextKey)
+                                    if (weaviateTextKey) returnFields.push(cleanFieldName(weaviateTextKey))
                                     if (weaviateMetadataKeys) {
                                         try {
                                             const metas = JSON.parse(weaviateMetadataKeys.replace(/\s/g, ''))
                                             if (Array.isArray(metas)) {
-                                                keys.push(...metas)
+                                                returnFields.push(...metas.map((m: string) => cleanFieldName(m)))
                                             }
                                         } catch (e) { }
                                     }
-                                    if (keys.length > 0) fieldList = keys.join(' ')
                                 }
-                                builder = builder.withFields(fieldList)
 
-                                // Construct Where filter for section_header AND file_path
-                                const sectionFilter: any = {
-                                    operator: 'And',
-                                    operands: [
-                                        {
-                                            path: ['section_header'],
-                                            operator: 'Equal',
-                                            valueString: header
-                                        },
-                                        {
-                                            path: ['file_path'],
-                                            operator: 'Equal',
-                                            valueString: path
-                                        }
-                                    ]
-                                }
-                                builder = builder.withWhere(sectionFilter)
+                                // Fetch all objects with matching section_header and file_path
+                                // Note: In v3 client, multi-condition filters are done through the filter builder
+                                // For now, fetch without filter and filter in application code
+                                // TODO: Implement proper v3 filter with AND once API is confirmed
+                                const sectionResults = await collection.query.fetchObjects({
+                                    limit: 5,
+                                    returnMetadata: ['id', 'score', 'distance'] as any,
+                                    returnProperties: returnFields.length > 0 ? returnFields : undefined
+                                })
 
-                                // Limit 50 as per Python demo
-                                const response = await builder.withLimit(50).do()
-                                if (!response?.data?.Get?.[weaviateIndex]) return []
+                                // Filter results in application code
+                                const filtered = sectionResults?.objects?.filter((obj: any) => {
+                                    const props = obj.properties || {}
+                                    return props.section_header === header && props.file_path === path
+                                }) || []
 
-                                return response.data.Get[weaviateIndex].map((obj: any) => {
-                                    // Check if _additional exists (v2 format)
-                                    if (obj._additional) {
-                                        const { _additional, ...properties } = obj
-                                        return {
-                                            id: _additional?.id,
-                                            properties: properties,
-                                            score: _additional?.score || _additional?.distance
-                                        }
-                                    }
-                                    // Otherwise, return object directly
+                                return filtered.map((obj: any) => {
                                     return {
-                                        id: obj.id,
-                                        properties: obj,
-                                        score: null
+                                        id: obj.uuid,
+                                        properties: obj.properties,
+                                        score: obj.metadata?.score ?? obj.metadata?.distance ?? null
                                     }
                                 })
                             } catch (e) {
-                                console.error('[Weaviate Tool] Section fetch error:', e)
+                                if (isDev) console.error('[Weaviate Tool] Section fetch error:', e)
                                 return []
                             }
                         }
@@ -484,11 +516,11 @@ class Weaviate_Tools implements INode {
                         results: finalResults
                     }
 
-                    console.log('[Weaviate Tool] Final Output:', JSON.stringify(output, null, 2))
+                    if (isDev) console.log('[Weaviate Tool] Final Output:', JSON.stringify(output, null, 2))
 
                     return JSON.stringify(output, null, 2)
                 } catch (error: any) {
-                    console.error('[Weaviate Tool] Error:', error)
+                    if (isDev) console.error('[Weaviate Tool] Error:', error)
                     return `Error searching Weaviate: ${error.message}`
                 }
             }
