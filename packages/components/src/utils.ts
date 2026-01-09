@@ -1760,3 +1760,60 @@ export const parseJsonBody = (body: string): any => {
         }
     }
 }
+
+/**
+ * Checks if an object contains dangerous prototype pollution keys
+ * @param obj - Object to check
+ * @returns true if object contains dangerous keys
+ */
+export function containsPrototypePollution(obj: unknown): boolean {
+    if (typeof obj !== 'object' || obj === null || !obj) {
+        return false
+    }
+
+    const dangerousKeys = ['__proto__', 'constructor', 'prototype']
+
+    // Check arrays recursively
+    if (Array.isArray(obj)) {
+        return obj.some(item => containsPrototypePollution(item))
+    }
+
+    // Check objects
+    for (const key in obj as object) {
+        if (dangerousKeys.includes(key)) {
+            return true
+        }
+
+        const value = (obj as Record<string, unknown>)[key]
+        if (typeof value === 'object' && value !== null) {
+            if (containsPrototypePollution(value)) {
+                return true
+            }
+        }
+    }
+
+    return false
+}
+
+/**
+ * Safely parses JSON with prototype pollution protection
+ * @param body - JSON string to parse
+ * @returns Parsed object or throws error
+ * @throws Error if JSON is invalid or contains prototype pollution
+ */
+export function parseJsonSafely(body: string): unknown {
+    try {
+        const parsed = JSON5.parse(body) as unknown
+
+        if (containsPrototypePollution(parsed)) {
+            throw new Error('JSON contains dangerous prototype pollution patterns')
+        }
+
+        return parsed
+    } catch (error) {
+        if (error instanceof Error && error.message.includes('prototype pollution')) {
+            throw error
+        }
+        throw new Error(`Invalid JSON: ${error instanceof Error ? error.message : String(error)}`)
+    }
+}

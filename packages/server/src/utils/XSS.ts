@@ -26,14 +26,15 @@ export function getAllowedCorsOrigins(): string {
 
 export function getCorsOptions(): any {
     const corsOptions = {
-        origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
+        origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean | string) => void) {
             const allowedOrigins = getAllowedCorsOrigins()
             if (!origin || allowedOrigins == '*' || allowedOrigins.indexOf(origin) !== -1) {
-                callback(null, true)
+                callback(null, origin)
             } else {
                 callback(null, false)
             }
-        }
+        },
+        credentials: true
     }
     return corsOptions
 }
