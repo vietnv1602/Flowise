@@ -1,13 +1,72 @@
 import { flatten } from 'lodash'
-import weaviate, { WeaviateClient, ApiKey } from 'weaviate-ts-client'
+import weaviate, { WeaviateClient } from 'weaviate-client'
 import { WeaviateLibArgs, WeaviateStore } from '@langchain/weaviate'
 import { Document } from '@langchain/core/documents'
 import { Embeddings } from '@langchain/core/embeddings'
 import { ICommonObject, INode, INodeData, INodeOutputsValue, INodeParams, IndexingResult } from '../../../src/Interface'
 import { getBaseClasses, getCredentialData, getCredentialParam, normalizeKeysRecursively } from '../../../src/utils'
+import { validateAndSanitizeHeaders } from '../../../src/httpSecurity'
 import { addMMRInputParams, resolveVectorStoreOrRetriever } from '../VectorStoreUtils'
 import { index } from '../../../src/indexing'
 import { VectorStore } from '@langchain/core/vectorstores'
+import { RecordManagerInterface } from '@langchain/community/indexes/base'
+
+/**
+ * Extended record manager interface with namespace property
+ */
+interface RecordManagerWithNamespace extends RecordManagerInterface {
+    namespace: string
+}
+
+/**
+ * Weaviate vector store or retriever return type
+ */
+type WeaviateVectorStoreOutput = VectorStore | ReturnType<VectorStore['asRetriever']> | undefined
+
+const getWeaviateClient = async (nodeData: INodeData, options: ICommonObject): Promise<WeaviateClient> => {
+    const weaviateScheme = nodeData.inputs?.weaviateScheme as string
+    const weaviateHost = nodeData.inputs?.weaviateHost as string
+    const weaviateHeaders = nodeData.inputs?.weaviateHeaders as string
+    const credentialData = await getCredentialData(nodeData.credential ?? '', options)
+    const weaviateApiKey = getCredentialParam('weaviateApiKey', credentialData, nodeData)
+
+    let headers: Record<string, string> = {}
+    if (weaviateHeaders) {
+        try {
+            const parsed = typeof weaviateHeaders === 'object' ? weaviateHeaders : JSON.parse(weaviateHeaders)
+
+            // Validate it's an object
+            if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+                throw new Error('Headers must be a JSON object')
+            }
+
+            headers = validateAndSanitizeHeaders(parsed)
+        } catch (e) {
+            throw new Error(`Invalid Weaviate Headers: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+
+    if (weaviateScheme === 'https') {
+        const hostUrl = `https://${weaviateHost}`
+        return await weaviate.connectToWeaviateCloud(hostUrl, {
+            authCredentials: weaviateApiKey ? new weaviate.ApiKey(weaviateApiKey) : undefined,
+            headers: headers
+        })
+    } else {
+        const [host, portStr] = weaviateHost.replace('http://', '').split(':')
+        const httpPort = portStr ? parseInt(portStr) : 8080
+        return await weaviate.connectToCustom({
+            httpHost: host,
+            httpPort: httpPort,
+            grpcHost: host,
+            grpcPort: 50051,
+            httpSecure: false,
+            grpcSecure: false,
+            authCredentials: weaviateApiKey ? new weaviate.ApiKey(weaviateApiKey) : undefined,
+            headers: headers
+        })
+    }
+}
 
 class Weaviate_VectorStores implements INode {
     label: string
@@ -122,6 +181,13 @@ class Weaviate_VectorStores implements INode {
                 additionalParams: true,
                 optional: true,
                 acceptVariable: true
+            },
+            {
+                label: 'Weaviate Headers',
+                name: 'weaviateHeaders',
+                type: 'json',
+                additionalParams: true,
+                optional: true
             }
         ]
         addMMRInputParams(this.inputs)
@@ -152,8 +218,6 @@ class Weaviate_VectorStores implements INode {
     //@ts-ignore
     vectorStoreMethods = {
         async upsert(nodeData: INodeData, options: ICommonObject): Promise<Partial<IndexingResult>> {
-            const weaviateScheme = nodeData.inputs?.weaviateScheme as string
-            const weaviateHost = nodeData.inputs?.weaviateHost as string
             const weaviateIndex = nodeData.inputs?.weaviateIndex as string
             const weaviateTextKey = nodeData.inputs?.weaviateTextKey as string
             const weaviateMetadataKeys = nodeData.inputs?.weaviateMetadataKeys as string
@@ -161,16 +225,7 @@ class Weaviate_VectorStores implements INode {
             const embeddings = nodeData.inputs?.embeddings as Embeddings
             const recordManager = nodeData.inputs?.recordManager
 
-            const credentialData = await getCredentialData(nodeData.credential ?? '', options)
-            const weaviateApiKey = getCredentialParam('weaviateApiKey', credentialData, nodeData)
-
-            const clientConfig: any = {
-                scheme: weaviateScheme,
-                host: weaviateHost
-            }
-            if (weaviateApiKey) clientConfig.apiKey = new ApiKey(weaviateApiKey)
-
-            const client: WeaviateClient = weaviate.client(clientConfig)
+            const client = await getWeaviateClient(nodeData, options)
 
             const flattenDocs = docs && docs.length ? flatten(docs) : []
             const finalDocs = []
@@ -217,24 +272,13 @@ class Weaviate_VectorStores implements INode {
             }
         },
         async delete(nodeData: INodeData, ids: string[], options: ICommonObject): Promise<void> {
-            const weaviateScheme = nodeData.inputs?.weaviateScheme as string
-            const weaviateHost = nodeData.inputs?.weaviateHost as string
             const weaviateIndex = nodeData.inputs?.weaviateIndex as string
             const weaviateTextKey = nodeData.inputs?.weaviateTextKey as string
             const weaviateMetadataKeys = nodeData.inputs?.weaviateMetadataKeys as string
             const embeddings = nodeData.inputs?.embeddings as Embeddings
             const recordManager = nodeData.inputs?.recordManager
 
-            const credentialData = await getCredentialData(nodeData.credential ?? '', options)
-            const weaviateApiKey = getCredentialParam('weaviateApiKey', credentialData, nodeData)
-
-            const clientConfig: any = {
-                scheme: weaviateScheme,
-                host: weaviateHost
-            }
-            if (weaviateApiKey) clientConfig.apiKey = new ApiKey(weaviateApiKey)
-
-            const client: WeaviateClient = weaviate.client(clientConfig)
+            const client = await getWeaviateClient(nodeData, options)
 
             const obj: WeaviateLibArgs = {
                 //@ts-ignore
@@ -251,7 +295,9 @@ class Weaviate_VectorStores implements INode {
                 if (recordManager) {
                     const vectorStoreName = weaviateTextKey ? weaviateIndex + '_' + weaviateTextKey : weaviateIndex
                     await recordManager.createSchema()
-                    ;(recordManager as any).namespace = (recordManager as any).namespace + '_' + vectorStoreName
+                    // Type assertion for namespace property that extends RecordManagerInterface
+                    const recordManagerWithNamespace = recordManager as RecordManagerWithNamespace
+                    recordManagerWithNamespace.namespace = recordManagerWithNamespace.namespace + '_' + vectorStoreName
                     const keys: string[] = await recordManager.listKeys({})
 
                     await weaviateStore.delete({ ids: keys })
@@ -265,25 +311,14 @@ class Weaviate_VectorStores implements INode {
         }
     }
 
-    async init(nodeData: INodeData, _: string, options: ICommonObject): Promise<any> {
-        const weaviateScheme = nodeData.inputs?.weaviateScheme as string
-        const weaviateHost = nodeData.inputs?.weaviateHost as string
+    async init(nodeData: INodeData, _: string, options: ICommonObject): Promise<WeaviateVectorStoreOutput> {
         const weaviateIndex = nodeData.inputs?.weaviateIndex as string
         const weaviateTextKey = nodeData.inputs?.weaviateTextKey as string
         const weaviateMetadataKeys = nodeData.inputs?.weaviateMetadataKeys as string
         const embeddings = nodeData.inputs?.embeddings as Embeddings
         let weaviateFilter = nodeData.inputs?.weaviateFilter
 
-        const credentialData = await getCredentialData(nodeData.credential ?? '', options)
-        const weaviateApiKey = getCredentialParam('weaviateApiKey', credentialData, nodeData)
-
-        const clientConfig: any = {
-            scheme: weaviateScheme,
-            host: weaviateHost
-        }
-        if (weaviateApiKey) clientConfig.apiKey = new ApiKey(weaviateApiKey)
-
-        const client: WeaviateClient = weaviate.client(clientConfig)
+        const client = await getWeaviateClient(nodeData, options)
 
         const obj: WeaviateLibArgs = {
             //@ts-ignore

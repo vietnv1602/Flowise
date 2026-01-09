@@ -21,8 +21,11 @@ RUN npm install -g pnpm
 
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
-
 ENV NODE_OPTIONS=--max-old-space-size=8192
+
+# DEBUG mode should be controlled at runtime, not hardcoded
+# To enable debug mode, run with: docker run -e DEBUG=true -p 3000:3000 flowise
+# Or in docker-compose: environment: - DEBUG=${DEBUG:-false}
 
 WORKDIR /usr/src
 
@@ -32,6 +35,14 @@ COPY . .
 RUN pnpm install
 
 RUN pnpm build
+
+# Create non-root user for security
+# Running as non-root prevents privilege escalation if container is compromised
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001 && \
+    chown -R nodejs:nodejs /usr/src
+
+USER nodejs
 
 EXPOSE 3000
 

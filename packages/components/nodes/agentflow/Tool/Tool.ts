@@ -1,13 +1,52 @@
 import { ICommonObject, INode, INodeData, INodeOptionsValue, INodeParams, IServerSideEventStreamer } from '../../../src/Interface'
 import { updateFlowState } from '../utils'
-import { processTemplateVariables } from '../../../src/utils'
+import { processTemplateVariables, containsPrototypePollution } from '../../../src/utils'
 import { Tool } from '@langchain/core/tools'
 import { ARTIFACTS_PREFIX, TOOL_ARGS_PREFIX } from '../../../src/agents'
 import zodToJsonSchema from 'zod-to-json-schema'
+import { z } from 'zod'
 
 interface IToolInputArgs {
     inputArgName: string
     inputArgValue: string
+}
+
+/**
+ * JSON Schema structure returned by zodToJsonSchema
+ */
+interface JsonSchema {
+    properties?: Record<string, JsonSchemaProperty>
+    $schema?: string
+    required?: string[]
+    [key: string]: unknown
+}
+
+interface JsonSchemaProperty {
+    description?: string
+    type?: string
+    [key: string]: unknown
+}
+
+/**
+ * Tool execution return value type
+ */
+type ToolExecutionValue = string | number | boolean | object | unknown[] | null
+
+/**
+ * Return type for the tool execution
+ */
+interface ToolExecutionReturn {
+    id: string
+    name: string
+    input: {
+        toolInputArgs: IToolInputArgs[] | Record<string, unknown>
+        selectedTool: string
+    }
+    output: {
+        content: string
+        artifacts?: unknown
+    }
+    state: ICommonObject
 }
 
 class Tool_Agentflow implements INode {
@@ -136,12 +175,17 @@ class Tool_Agentflow implements INode {
             const nodeModule = await import(nodeInstanceFilePath)
             const newToolNodeInstance = new nodeModule.nodeClass()
 
+            const sanitizedToolConfig: ICommonObject = {}
+            for (const key in selectedToolConfig) {
+                sanitizedToolConfig[key] = removeHtmlTags(selectedToolConfig[key])
+            }
+
             const newNodeData = {
                 ...nodeData,
                 credential: selectedToolConfig['FLOWISE_CREDENTIAL_ID'],
                 inputs: {
                     ...nodeData.inputs,
-                    ...selectedToolConfig
+                    ...sanitizedToolConfig
                 }
             }
 
@@ -154,7 +198,8 @@ class Tool_Agentflow implements INode {
                     // Combine schemas from all tools in the array
                     const allProperties = toolInstance.reduce((acc, tool) => {
                         if (tool?.schema) {
-                            const schema: Record<string, any> = zodToJsonSchema(tool.schema)
+                            // @ts-ignore - zodToJsonSchema type compatibility issue
+                            const schema = zodToJsonSchema(tool.schema) as JsonSchema
                             return { ...acc, ...(schema.properties || {}) }
                         }
                         return acc
@@ -162,7 +207,8 @@ class Tool_Agentflow implements INode {
                     toolInputArgs = { properties: allProperties }
                 } else {
                     // Handle single tool instance
-                    toolInputArgs = toolInstance.schema ? zodToJsonSchema(toolInstance.schema as any) : {}
+                    // @ts-ignore - zodToJsonSchema type compatibility issue
+                    toolInputArgs = toolInstance.schema ? (zodToJsonSchema(toolInstance.schema) as JsonSchema) : {}
                 }
 
                 if (toolInputArgs && Object.keys(toolInputArgs).length > 0) {
@@ -186,7 +232,7 @@ class Tool_Agentflow implements INode {
         }
     }
 
-    async run(nodeData: INodeData, input: string, options: ICommonObject): Promise<any> {
+    async run(nodeData: INodeData, input: string, options: ICommonObject): Promise<ToolExecutionReturn> {
         const selectedTool = (nodeData.inputs?.selectedTool as string) || (nodeData.inputs?.toolAgentflowSelectedTool as string)
         const selectedToolConfig =
             (nodeData?.inputs?.selectedToolConfig as ICommonObject) ||
@@ -216,19 +262,30 @@ class Tool_Agentflow implements INode {
         const nodeInstanceFilePath = options.componentNodes[selectedTool].filePath as string
         const nodeModule = await import(nodeInstanceFilePath)
         const newToolNodeInstance = new nodeModule.nodeClass()
+
+        const sanitizedToolConfig: ICommonObject = {}
+        for (const key in selectedToolConfig) {
+            sanitizedToolConfig[key] = removeHtmlTags(selectedToolConfig[key])
+        }
+
         const newNodeData = {
             ...nodeData,
             credential: selectedToolConfig['FLOWISE_CREDENTIAL_ID'],
             inputs: {
                 ...nodeData.inputs,
-                ...selectedToolConfig
+                ...sanitizedToolConfig
             }
         }
         const toolInstance = (await newToolNodeInstance.init(newNodeData, '', options)) as Tool | Tool[]
 
-        let toolCallArgs: Record<string, any> = {}
+        let toolCallArgs: Record<string, ToolExecutionValue> = {}
 
-        const parseInputValue = (value: string): any => {
+        /**
+         * Safely parses JSON input and protects against prototype pollution
+         * @param value - String value to parse
+         * @returns Parsed value (object, array, or string) or original value if not a string
+         */
+        const parseInputValue = (value: string): ToolExecutionValue => {
             if (typeof value !== 'string') {
                 return value
             }
@@ -243,13 +300,23 @@ class Tool_Agentflow implements INode {
                 .replace(/\\\{/g, '{') // \{ -> {
                 .replace(/\\\}/g, '}') // \} -> }
 
+            cleanedValue = removeHtmlTags(cleanedValue)
+
             // Try to parse as JSON if it looks like JSON/array
             if (
                 (cleanedValue.startsWith('[') && cleanedValue.endsWith(']')) ||
                 (cleanedValue.startsWith('{') && cleanedValue.endsWith('}'))
             ) {
                 try {
-                    return JSON.parse(cleanedValue)
+                    const parsed = JSON.parse(cleanedValue)
+
+                    // Check for prototype pollution attempts
+                    if (containsPrototypePollution(parsed)) {
+                        console.warn('Prototype pollution attempt detected in input value, returning cleaned string instead')
+                        return cleanedValue
+                    }
+
+                    return parsed
                 } catch (e) {
                     // If parsing fails, return the cleaned value
                     return cleanedValue
@@ -352,6 +419,40 @@ class Tool_Agentflow implements INode {
             throw new Error(e)
         }
     }
+}
+
+/**
+ * Removes HTML tags from a string value.
+ * Handles encoded HTML entities to prevent bypass attempts.
+ * Used for sanitization to prevent XSS and injection attacks.
+ *
+ * @param value - The string to sanitize (non-strings are returned as-is)
+ * @returns The sanitized string without HTML tags
+ *
+ * @example
+ * removeHtmlTags('<script>alert("xss")</script>test') // 'test'
+ * removeHtmlTags('&lt;script&gt;alert("xss")&lt;/script&gt;') // 'alert("xss")'
+ */
+const removeHtmlTags = (value: string): string => {
+    if (typeof value !== 'string') return value
+
+    // First decode HTML entities to catch bypass attempts
+    let decoded = value
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&')
+        .replace(/&quot;/g, '"')
+        .replace(/&#x27;/g, "'")
+        .replace(/&#x2F;/g, '/')
+        .replace(/&#39;/g, "'")
+        .replace(/&#34;/g, '"')
+        .replace(/&#47;/g, '/')
+        .replace(/&#60;/g, '<')
+        .replace(/&#62;/g, '>')
+        .replace(/&#38;/g, '&')
+
+    // Remove HTML tags after decoding
+    return decoded.replace(/<[^>]*>/g, '')
 }
 
 module.exports = { nodeClass: Tool_Agentflow }

@@ -4,6 +4,22 @@ import axios, { AxiosRequestConfig, AxiosResponse } from 'axios'
 import fetch, { RequestInit, Response } from 'node-fetch'
 
 /**
+ * Allowed headers for external service requests (prevents SSRF attacks)
+ * These headers are used by vectorization and API services
+ */
+export const ALLOWED_HEADERS = [
+    'x-openai-api-key',
+    'x-cohere-api-key',
+    'x-huggingface-api-key',
+    'authorization',
+    'x-api-key'
+] as const
+
+const MAX_HEADER_SIZE = 8192 // 8KB per header
+const MAX_HEADER_COUNT = 20
+const MAX_TOTAL_HEADER_SIZE = 65536 // 64KB total
+
+/**
  * Checks if an IP address is in the deny list
  * @param ip - IP address to check
  * @param denyList - Array of denied IP addresses/CIDR ranges
@@ -218,4 +234,63 @@ export async function secureFetch(url: string, init?: RequestInit, maxRedirects:
     }
 
     throw new Error('Too many redirects')
+}
+
+/**
+ * Validates and sanitizes headers to prevent SSRF and injection attacks
+ * @param headers - Raw headers object from user input
+ * @returns Sanitized headers object
+ * @throws Error if validation fails
+ */
+export function validateAndSanitizeHeaders(headers: Record<string, unknown>): Record<string, string> {
+    const sanitized: Record<string, string> = {}
+    const headerKeys = Object.keys(headers)
+
+    // Check header count
+    if (headerKeys.length > MAX_HEADER_COUNT) {
+        throw new Error(`Too many headers (${headerKeys.length}). Maximum allowed: ${MAX_HEADER_COUNT}`)
+    }
+
+    // Check total size
+    const totalSize = JSON.stringify(headers).length
+    if (totalSize > MAX_TOTAL_HEADER_SIZE) {
+        throw new Error(`Total headers size too large: ${totalSize} bytes. Maximum allowed: ${MAX_TOTAL_HEADER_SIZE}`)
+    }
+
+    for (const [key, value] of Object.entries(headers)) {
+        // Validate header key
+        if (typeof key !== 'string' || key.length === 0) {
+            throw new Error('Header names must be non-empty strings')
+        }
+
+        if (key.length > 255) {
+            throw new Error(`Header name too long: ${key.length} characters`)
+        }
+
+        // Check against whitelist
+        const lowerKey = key.toLowerCase()
+        if (!ALLOWED_HEADERS.some(allowed => allowed.toLowerCase() === lowerKey)) {
+            throw new Error(
+                `Header "${key}" is not allowed. Allowed headers: ${ALLOWED_HEADERS.join(', ')}`
+            )
+        }
+
+        // Validate header value
+        if (typeof value !== 'string') {
+            throw new Error(`Header value for "${key}" must be a string`)
+        }
+
+        if (value.length > MAX_HEADER_SIZE) {
+            throw new Error(`Header value for "${key}" too large: ${value.length} characters`)
+        }
+
+        // Prevent CRLF injection
+        if (/[\r\n]/.test(value)) {
+            throw new Error(`Header value for "${key}" contains invalid characters (CRLF injection detected)`)
+        }
+
+        sanitized[key] = value
+    }
+
+    return sanitized
 }

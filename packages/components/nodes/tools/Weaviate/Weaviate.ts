@@ -1,8 +1,26 @@
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getCredentialData, getCredentialParam } from '../../../src/utils'
+import { validateAndSanitizeHeaders } from '../../../src/httpSecurity'
 import { DynamicStructuredTool } from '@langchain/core/tools'
 import { z } from 'zod'
-import weaviate, { ApiKey, AuthUserPasswordCredentials } from 'weaviate-ts-client'
+import weaviate, { ApiKey } from 'weaviate-ts-client'
+
+/**
+ * Weaviate client configuration interface
+ */
+interface WeaviateClientConfig {
+    scheme: string
+    host: string
+    headers: Record<string, string>
+    apiKey?: ApiKey
+}
+
+/**
+ * Tool input interface
+ */
+interface WeaviateToolInput {
+    query: string
+}
 
 class Weaviate_Tools implements INode {
     label: string
@@ -49,6 +67,13 @@ class Weaviate_Tools implements INode {
                 ]
             },
             {
+                label: 'Weaviate Headers',
+                name: 'weaviateHeaders',
+                type: 'json',
+                additionalParams: true,
+                optional: true
+            },
+            {
                 label: 'Weaviate Host',
                 name: 'weaviateHost',
                 type: 'string',
@@ -92,20 +117,38 @@ class Weaviate_Tools implements INode {
         this.baseClasses = [this.type, 'Tool', 'StructuredTool', 'Runnable']
     }
 
-    async init(nodeData: INodeData, _: string, options: ICommonObject): Promise<any> {
+    async init(nodeData: INodeData, _: string, options: ICommonObject): Promise<DynamicStructuredTool> {
         const weaviateScheme = nodeData.inputs?.weaviateScheme as string
         const weaviateHost = nodeData.inputs?.weaviateHost as string
         const weaviateIndex = nodeData.inputs?.weaviateIndex as string
         const fields = nodeData.inputs?.fields as string
         const topK = nodeData.inputs?.topK as string
         const toolDescription = nodeData.inputs?.toolDescription as string
+        const weaviateHeaders = nodeData.inputs?.weaviateHeaders as string
 
         const credentialData = await getCredentialData(nodeData.credential ?? '', options)
         const weaviateApiKey = getCredentialParam('weaviateApiKey', credentialData, nodeData)
 
-        const clientConfig: any = {
+        let headers: Record<string, string> = {}
+        if (weaviateHeaders) {
+            try {
+                const parsed = typeof weaviateHeaders === 'object' ? weaviateHeaders : JSON.parse(weaviateHeaders)
+
+                // Validate it's an object
+                if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+                    throw new Error('Headers must be a JSON object')
+                }
+
+                headers = validateAndSanitizeHeaders(parsed)
+            } catch (e) {
+                throw new Error(`Invalid Weaviate Headers: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+
+        const clientConfig: WeaviateClientConfig = {
             scheme: weaviateScheme,
-            host: weaviateHost
+            host: weaviateHost,
+            headers: headers
         }
 
         if (weaviateApiKey) {
@@ -120,7 +163,7 @@ class Weaviate_Tools implements INode {
             schema: z.object({
                 query: z.string().describe('The search query string'),
             }),
-            func: async (input: any) => {
+            func: async (input: WeaviateToolInput) => {
                 const { query } = input
                 try {
                     const fieldList = fields.split(',').map((f) => f.trim()).join(' ')
@@ -135,8 +178,9 @@ class Weaviate_Tools implements INode {
 
                     const data = response.data.Get[weaviateIndex]
                     return JSON.stringify(data, null, 2)
-                } catch (error: any) {
-                    return `Error searching Weaviate: ${error.message}`
+                } catch (error: unknown) {
+                    const errorMessage = error instanceof Error ? error.message : String(error)
+                    return `Error searching Weaviate: ${errorMessage}`
                 }
             }
         })
