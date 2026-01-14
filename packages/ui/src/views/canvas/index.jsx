@@ -27,6 +27,8 @@ import ConfirmDialog from '@/ui-component/dialog/ConfirmDialog'
 import ChatPopUp from '@/views/chatmessage/ChatPopUp'
 import VectorStorePopUp from '@/views/vectorstore/VectorStorePopUp'
 import { flowContext } from '@/store/context/ReactFlowContext'
+import { ChatBuilderPanel } from '@/features/ai-chat-builder/components/ChatBuilderPanel'
+import { CanvasAIButton } from '@/features/ai-chat-builder/integrations/CanvasAIButton'
 
 // API
 import nodesApi from '@/api/nodes'
@@ -81,7 +83,7 @@ const Canvas = () => {
     const canvas = useSelector((state) => state.canvas)
     const [canvasDataStore, setCanvasDataStore] = useState(canvas)
     const [chatflow, setChatflow] = useState(null)
-    const { reactFlowInstance, setReactFlowInstance} = useContext(flowContext)
+    const { reactFlowInstance, setReactFlowInstance } = useContext(flowContext)
 
     // ==============================|| Snackbar ||============================== //
 
@@ -99,6 +101,8 @@ const Canvas = () => {
     const [isSyncNodesButtonEnabled, setIsSyncNodesButtonEnabled] = useState(false)
     const [isSnappingEnabled, setIsSnappingEnabled] = useState(false)
     const [isBackgroundEnabled, setIsBackgroundEnabled] = useState(true)
+    const [isChatBuilderOpen, setIsChatBuilderOpen] = useState(false)
+    const [chatPopupOpen, setChatPopupOpen] = useState(false)
 
     const reactFlowWrapper = useRef(null)
 
@@ -582,7 +586,7 @@ const Canvas = () => {
                 </AppBar>
                 <Box sx={{ pt: '70px', height: '100vh', width: '100%' }}>
                     <div className='reactflow-parent-wrapper'>
-                        <div className='reactflow-wrapper' ref={reactFlowWrapper}>
+                        <div className='reactflow-wrapper' ref={reactFlowWrapper} style={{ position: 'relative' }}>
                             <ReactFlow
                                 nodes={nodes}
                                 edges={edges}
@@ -656,7 +660,25 @@ const Canvas = () => {
                                     </Fab>
                                 )}
                                 {isUpsertButtonEnabled && <VectorStorePopUp chatflowid={chatflowId} />}
-                                <ChatPopUp isAgentCanvas={isAgentCanvas} chatflowid={chatflowId} />
+                                <ChatPopUp isAgentCanvas={isAgentCanvas} chatflowid={chatflowId} onOpenChange={setChatPopupOpen} />
+                                <CanvasAIButton
+                                    position="top-right"
+                                    chatflowId={chatflowId}
+                                    isAgentCanvas={isAgentCanvas}
+                                    chatPopupOpen={chatPopupOpen}
+                                    onFlowGenerated={(flowData) => {
+                                        // Apply generated flow to canvas
+                                        if (flowData.nodes) {
+                                            setNodes(flowData.nodes || [])
+                                        }
+                                        if (flowData.edges) {
+                                            setEdges(flowData.edges || [])
+                                        }
+                                        if (flowData.viewport) {
+                                            reactFlowInstance?.setViewport(flowData.viewport)
+                                        }
+                                    }}
+                                />
                             </ReactFlow>
                         </div>
                     </div>

@@ -31,6 +31,7 @@ import ConfirmDialog from '@/ui-component/dialog/ConfirmDialog'
 import EditNodeDialog from '@/views/agentflowsv2/EditNodeDialog'
 import ChatPopUp from '@/views/chatmessage/ChatPopUp'
 import ValidationPopUp from '@/views/chatmessage/ValidationPopUp'
+import { CanvasAIButton } from '@/features/ai-chat-builder/integrations/CanvasAIButton'
 import { flowContext } from '@/store/context/ReactFlowContext'
 
 // API
@@ -798,6 +799,24 @@ const AgentflowCanvas = () => {
                                 )}
                                 <ChatPopUp isAgentCanvas={true} chatflowid={chatflowId} onOpenChange={setChatPopupOpen} />
                                 {!chatPopupOpen && <ValidationPopUp isAgentCanvas={true} chatflowid={chatflowId} />}
+                                <CanvasAIButton
+                                    position='top-right'
+                                    chatflowId={chatflowId}
+                                    isAgentCanvas={true}
+                                    chatPopupOpen={chatPopupOpen}
+                                    onFlowGenerated={(flowData) => {
+                                        // Apply generated flow to canvas
+                                        if (flowData.nodes) {
+                                            setNodes(flowData.nodes || [])
+                                        }
+                                        if (flowData.edges) {
+                                            setEdges(flowData.edges || [])
+                                        }
+                                        if (flowData.viewport) {
+                                            reactFlowInstance?.setViewport(flowData.viewport)
+                                        }
+                                    }}
+                                />
                             </ReactFlow>
                         </div>
                     </div>

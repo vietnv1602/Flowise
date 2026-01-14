@@ -141,7 +141,7 @@ const ValidationPopUp = ({ chatflowid, hidden }) => {
         <>
             {!hidden && (
                 <StyledFab
-                    sx={{ position: 'absolute', right: 80, top: 20 }}
+                    sx={{ position: 'absolute', right: 75, top: 20 }}
                     ref={anchorRef}
                     size='small'
                     color='teal'
