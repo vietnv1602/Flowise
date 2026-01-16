@@ -13,7 +13,9 @@ import {
     CostEstimate,
     AIProvider,
     CredentialInfo,
-    ProviderConfig
+    ProviderConfig,
+    Conversation,
+    ConversationDetail
 } from '../types'
 import { IChatBuilderService } from './IChatBuilderService'
 import { buildGenerationPrompt, estimateTokens } from '../utils/promptTemplates'
@@ -44,82 +46,115 @@ export class ChatBuilderService implements IChatBuilderService {
     }
 
     /**
+     * Chat with streaming response
+     */
+    async chatStream(
+        message: string,
+        model: string,
+        flowId: string,
+        flowType: 'chatflow' | 'agentflow',
+        conversationId?: string,
+        onChunk?: (chunk: string) => void,
+        onComplete?: (fullResponse: string) => void,
+        onError?: (error: string) => void,
+        onSessionId?: (sessionId: string) => void
+    ): Promise<string> {
+        const response = await fetch(`${this.config.apiBaseURL}/chat-builder/chat`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                message,
+                model,
+                flowId,
+                flowType,
+                conversationId
+            })
+        })
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ message: response.statusText }))
+            throw new Error(error.message || `HTTP ${response.status}: ${response.statusText}`)
+        }
+
+        const reader = response.body?.getReader()
+        if (!reader) {
+            throw new Error('Response body is not readable')
+        }
+
+        const decoder = new TextDecoder()
+        let fullResponse = ''
+        let responseConversationId = ''
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read()
+
+                if (done) break
+
+                const chunk = decoder.decode(value, { stream: true })
+                const lines = chunk.split('\n')
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(line.slice(6))
+
+                            if (data.type === 'conversationId') {
+                                responseConversationId = data.data
+                                onSessionId?.(responseConversationId)
+                            } else if (data.type === 'chunk') {
+                                fullResponse += data.data
+                                onChunk?.(data.data)
+                            } else if (data.type === 'done') {
+                                fullResponse = data.data
+                                onComplete?.(fullResponse)
+                            } else if (data.type === 'error') {
+                                onError?.(data.data)
+                                throw new Error(data.data)
+                            }
+                        } catch (e) {
+                            // Skip invalid JSON
+                        }
+                    }
+                }
+            }
+
+            return fullResponse
+        } finally {
+            reader.releaseLock()
+        }
+    }
+
+    /**
      * Generate a flow based on natural language description
      */
     async generateFlow(request: ChatBuilderRequest): Promise<ChatBuilderResponse> {
-        // Create abort controller for this request
-        this.abortController = new AbortController()
+        // Use simple chat instead of complex flow generation
+        const responseText = await this.chatStream(
+            request.description,
+            request.model || 'gpt-4o-mini',
+            'default',
+            'chatflow'
+        )
 
-        try {
-            // Build the prompt
-            const prompt = buildGenerationPrompt(request)
-
-            // Call the generation API
-            const response = await fetch(`${this.config.apiBaseURL}/chat-builder/generate`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    prompt,
-                    provider: request.selectedProvider,
-                    credentialId: request.credentialId,
-                    flowType: request.flowType || 'chatflow',
-                    requirements: request.requirements
-                }),
-                signal: this.abortController.signal
-            })
-
-            if (!response.ok) {
-                const error = await response.json().catch(() => ({ message: response.statusText }))
-                throw new Error(error.message || `HTTP ${response.status}: ${response.statusText}`)
-            }
-
-            const data = await response.json()
-
-            // Parse and validate the response
-            const flowData: FlowJSON = data.flowData || data
-            const sanitizedFlow = sanitizeFlowData(flowData)
-            const validation = await this.validateFlow(sanitizedFlow)
-
-            if (!validation.isValid) {
-                throw new Error(`Generated flow is invalid: ${validation.errors.map((e) => e.message).join(', ')}`)
-            }
-
-            // Build response
-            const chatBuilderResponse: ChatBuilderResponse = {
-                flowData: sanitizedFlow,
-                metadata: {
-                    provider: request.selectedProvider,
-                    model: data.model || 'unknown',
-                    tokensUsed: data.tokensUsed || estimateTokens(prompt),
-                    timestamp: new Date(),
-                    version: '1.0.0'
-                },
-                nodes: sanitizedFlow.nodes.map((n) => ({
-                    id: n.id,
-                    label: n.data?.label || n.data?.name || 'Unknown',
-                    type: n.data?.type || n.data?.name || 'Unknown',
-                    category: n.data?.category || 'Unknown',
-                    description: n.data?.description
-                })),
-                edges: sanitizedFlow.edges.map((e) => ({
-                    id: e.id,
-                    source: e.source,
-                    target: e.target,
-                    sourceHandle: e.sourceHandle,
-                    targetHandle: e.targetHandle
-                }))
-            }
-
-            return chatBuilderResponse
-        } catch (error: any) {
-            if (error.name === 'AbortError') {
-                throw new Error('Generation was cancelled')
-            }
-            throw error
-        } finally {
-            this.abortController = null
+        // Return a simple response (not flow data for now)
+        return {
+            flowData: {
+                nodes: [],
+                edges: [],
+                viewport: { x: 0, y: 0, zoom: 1 }
+            },
+            metadata: {
+                provider: request.selectedProvider || 'llmhub',
+                model: request.model || 'gpt-4o-mini',
+                tokensUsed: responseText.length,
+                timestamp: new Date(),
+                version: '1.0.0'
+            },
+            nodes: [],
+            edges: []
         }
     }
 
@@ -220,7 +255,8 @@ export class ChatBuilderService implements IChatBuilderService {
             'azure-openai': 30,
             cohere: 15,
             google: 10,
-            custom: 5
+            custom: 5,
+            llmhub: 5
         }
 
         const provider = request.selectedProvider
@@ -253,6 +289,72 @@ export class ChatBuilderService implements IChatBuilderService {
             return response.ok
         } catch {
             return false
+        }
+    }
+
+    /**
+     * Create a new conversation
+     */
+    async createConversation(flowId: string, flowType: 'chatflow' | 'agentflow', title?: string): Promise<string> {
+        const response = await fetch(`${this.config.apiBaseURL}/chat-builder/conversations`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ flowId, flowType, title })
+        })
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ message: response.statusText }))
+            throw new Error(error.message || `HTTP ${response.status}: ${response.statusText}`)
+        }
+
+        const data = await response.json()
+        return data.conversationId
+    }
+
+    /**
+     * Get list of conversations for a flow
+     */
+    async getConversations(flowId: string, flowType: 'chatflow' | 'agentflow'): Promise<Conversation[]> {
+        const response = await fetch(
+            `${this.config.apiBaseURL}/chat-builder/conversations?flowId=${encodeURIComponent(flowId)}&flowType=${encodeURIComponent(flowType)}`
+        )
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ message: response.statusText }))
+            throw new Error(error.message || `HTTP ${response.status}: ${response.statusText}`)
+        }
+
+        const data = await response.json()
+        return data.conversations || []
+    }
+
+    /**
+     * Get conversation detail with messages
+     */
+    async getConversationDetail(conversationId: string): Promise<ConversationDetail> {
+        const response = await fetch(`${this.config.apiBaseURL}/chat-builder/conversations/${encodeURIComponent(conversationId)}`)
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ message: response.statusText }))
+            throw new Error(error.message || `HTTP ${response.status}: ${response.statusText}`)
+        }
+
+        return await response.json()
+    }
+
+    /**
+     * Delete a conversation
+     */
+    async deleteConversation(conversationId: string): Promise<void> {
+        const response = await fetch(`${this.config.apiBaseURL}/chat-builder/conversations/${encodeURIComponent(conversationId)}`, {
+            method: 'DELETE'
+        })
+
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ message: response.statusText }))
+            throw new Error(error.message || `HTTP ${response.status}: ${response.statusText}`)
         }
     }
 

@@ -11,8 +11,7 @@ export * from './types'
 // Services
 export { ChatBuilderService, getChatBuilderService, resetChatBuilderService } from './services/ChatBuilderService'
 export { IChatBuilderService } from './services/IChatBuilderService'
-export { FlowGeneratorFactory } from './services/flowGenerator/FlowGeneratorFactory'
-export { IFlowGenerator } from './services/flowGenerator/IFlowGenerator'
+
 
 // Hooks
 export { useChatBuilder, UseChatBuilderReturn } from './hooks/useChatBuilder'

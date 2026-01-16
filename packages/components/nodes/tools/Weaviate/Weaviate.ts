@@ -1,8 +1,6 @@
 import { ICommonObject, INode, INodeData, INodeParams } from '../../../src/Interface'
 import { getCredentialData, getCredentialParam } from '../../../src/utils'
 import { DynamicStructuredTool } from '@langchain/core/tools'
-import { Embeddings } from '@langchain/core/embeddings'
-import { OpenAIEmbeddings } from '@langchain/openai'
 import { z } from 'zod'
 import weaviate from 'weaviate-client'
 
@@ -37,37 +35,6 @@ class Weaviate_Tools implements INode {
             optional: true
         }
         this.inputs = [
-            {
-                label: 'Embeddings',
-                name: 'embeddings',
-                type: 'Embeddings',
-                optional: true
-            },
-            {
-                label: 'Embedding API Key',
-                name: 'embeddingApiKey',
-                type: 'string',
-                description: 'API Key for internal embedding generation (Standard OpenAI format)',
-                additionalParams: true,
-                acceptVariable: true
-            },
-            {
-                label: 'Embedding Model Name',
-                name: 'embeddingModelName',
-                type: 'string',
-                description: 'Model name for internal embedding (e.g. text-embedding-3-small)',
-                additionalParams: true,
-                acceptVariable: true
-            },
-            {
-                label: 'Embedding Base URL',
-                name: 'embeddingBaseUrl',
-                type: 'string',
-                description: 'Base URL for internal embedding (compatible with OpenAI/LocalAI)',
-                optional: true,
-                additionalParams: true,
-                acceptVariable: true
-            },
             {
                 label: 'Weaviate Scheme',
                 name: 'weaviateScheme',
@@ -190,6 +157,16 @@ class Weaviate_Tools implements INode {
                 acceptVariable: true
             },
             {
+                label: 'Additional Headers',
+                name: 'additionalHeaders',
+                type: 'json',
+                description:
+                    'Additional HTTP headers (e.g., {"X-OpenAI-Api-Key": "sk-..."}). Weaviate will use collection\'s configured vectorizer.',
+                additionalParams: true,
+                optional: true,
+                acceptVariable: true
+            },
+            {
                 label: 'Tool Description',
                 name: 'toolDescription',
                 type: 'string',
@@ -208,32 +185,18 @@ class Weaviate_Tools implements INode {
         const weaviateIndex = nodeData.inputs?.weaviateIndex as string
         const weaviateTextKey = nodeData.inputs?.weaviateTextKey as string
         const weaviateMetadataKeys = nodeData.inputs?.weaviateMetadataKeys as string
-        const embeddings = nodeData.inputs?.embeddings as Embeddings
         const fields = nodeData.inputs?.fields as string
         const topK = nodeData.inputs?.topK as string
         const toolDescription = nodeData.inputs?.toolDescription as string
         const searchMethod = nodeData.inputs?.searchMethod as string
         const hybridAlpha = nodeData.inputs?.hybridAlpha as string
-        const embeddingApiKey = nodeData.inputs?.embeddingApiKey as string
-        const embeddingModelName = nodeData.inputs?.embeddingModelName as string
-        const embeddingBaseUrl = nodeData.inputs?.embeddingBaseUrl as string
         const grpcPort = nodeData.inputs?.grpcPort as number
         const queryTimeout = nodeData.inputs?.queryTimeout as number
+        const additionalHeaders = nodeData.inputs?.additionalHeaders
         let weaviateFilter = nodeData.inputs?.weaviateFilter
 
         const credentialData = await getCredentialData(nodeData.credential ?? '', options)
         const weaviateApiKey = getCredentialParam('weaviateApiKey', credentialData, nodeData)
-
-        let resolvedEmbeddings = embeddings
-        if (!resolvedEmbeddings && embeddingApiKey) {
-            resolvedEmbeddings = new OpenAIEmbeddings({
-                openAIApiKey: embeddingApiKey,
-                modelName: embeddingModelName,
-                configuration: {
-                    baseURL: embeddingBaseUrl
-                }
-            })
-        }
 
         // Connect to Weaviate using v3 client
         // Parse host to extract hostname if it includes port
@@ -254,19 +217,32 @@ class Weaviate_Tools implements INode {
             httpHost: httpHost,
             httpPort: httpPort,
             httpSecure: weaviateScheme === 'https',
-            grpcHost: httpHost,  // Use same host for gRPC
+            grpcHost: httpHost, // Use same host for gRPC
             grpcPort: finalGrpcPort,
             grpcSecure: weaviateScheme === 'https',
-            skipInitChecks: true,  // Skip gRPC health check for servers without gRPC enabled
+            skipInitChecks: true, // Skip gRPC health check for servers without gRPC enabled
             timeout: {
-                init: 30,                      // 30 seconds for initialization
-                query: queryTimeout || 60,     // Use user-provided timeout or default 60s
-                insert: 120                    // 120 seconds for insertions
+                init: 30, // 30 seconds for initialization
+                query: queryTimeout || 60, // Use user-provided timeout or default 60s
+                insert: 120 // 120 seconds for insertions
             }
         }
 
         if (weaviateApiKey) {
             connectionConfig.authCredentials = new weaviate.ApiKey(weaviateApiKey)
+        }
+
+        // Add additional headers (e.g., X-OpenAI-Api-Key for collection vectorizer)
+        if (additionalHeaders) {
+            try {
+                if (typeof additionalHeaders === 'string') {
+                    connectionConfig.headers = JSON.parse(additionalHeaders)
+                } else {
+                    connectionConfig.headers = additionalHeaders
+                }
+            } catch (e) {
+                if (isDev) console.error('[Weaviate Tool] Failed to parse additionalHeaders:', e)
+            }
         }
 
         const client = await weaviate.connectToCustom(connectionConfig)
@@ -284,11 +260,17 @@ class Weaviate_Tools implements INode {
             }
         }
 
+        // Combine default description with user's custom description
+        const defaultDescription = 'Useful for retrieving relevant information from provided documents based on user queries'
+        const finalDescription = toolDescription ? `${defaultDescription}. ${toolDescription}` : defaultDescription
+
         return new DynamicStructuredTool({
             name: 'weaviate_search',
-            description: toolDescription,
+            description: finalDescription,
             schema: z.object({
-                query: z.array(z.string()).describe('Array of 2 search queries. Example: ["query1", "query2"]'),
+                query: z
+                    .array(z.string())
+                    .describe('List of 2 questions to retrieve information from documents. Example: ["question1", "question2"]')
             }),
             func: async (input: any) => {
                 const { query } = input
@@ -300,13 +282,17 @@ class Weaviate_Tools implements INode {
                 } else {
                     // Split by pipe (|) first, then by newline as fallback
                     if (query.includes('|')) {
-                        queries = query.split('|').map((q: string) => q.trim()).filter((q: string) => q !== '')
+                        queries = query
+                            .split('|')
+                            .map((q: string) => q.trim())
+                            .filter((q: string) => q !== '')
                     } else {
-                        queries = query.split('\n').map((q: string) => q.trim()).filter((q: string) => q !== '')
+                        queries = query
+                            .split('\n')
+                            .map((q: string) => q.trim())
+                            .filter((q: string) => q !== '')
                     }
                 }
-                if (isDev) console.log('[Weaviate Tool] Input Questions:', JSON.stringify(queries, null, 2))
-
                 try {
                     const executeSearch = async (singleQuery: string) => {
                         // Clean collection name - remove wildcards and special chars
@@ -345,51 +331,39 @@ class Weaviate_Tools implements INode {
                         if (searchMethod === 'Hybrid') {
                             const alpha = hybridAlpha ? parseFloat(hybridAlpha) : 0.5
 
-                            if (resolvedEmbeddings) {
-                                const vector = await resolvedEmbeddings.embedQuery(singleQuery)
-                                results = await collection.query.hybrid(
-                                    singleQuery,
-                                    {
-                                        limit: parseInt(topK) || 5,
-                                        alpha: alpha,
-                                        vector: vector,
-                                        returnMetadata: returnMetadata as any,
-                                        returnProperties: returnFields.length > 0 ? returnFields : undefined
-                                    }
-                                )
+                            if (additionalHeaders) {
+                                // Use collection's vectorizer via headers (e.g., X-OpenAI-Api-Key)
+                                results = await collection.query.hybrid(singleQuery, {
+                                    limit: parseInt(topK) || 5,
+                                    alpha: alpha,
+                                    returnMetadata: returnMetadata as any,
+                                    returnProperties: returnFields.length > 0 ? returnFields : undefined
+                                })
                             } else {
-                                results = await collection.query.hybrid(
-                                    singleQuery,
-                                    {
-                                        limit: parseInt(topK) || 5,
-                                        alpha: alpha,
-                                        returnMetadata: returnMetadata as any,
-                                        returnProperties: returnFields.length > 0 ? returnFields : undefined
-                                    }
-                                )
+                                // BM25 only (no vectorizer)
+                                results = await collection.query.hybrid(singleQuery, {
+                                    limit: parseInt(topK) || 5,
+                                    alpha: alpha,
+                                    returnMetadata: returnMetadata as any,
+                                    returnProperties: returnFields.length > 0 ? returnFields : undefined
+                                })
                             }
                         } else {
-                            // Similarity Search (nearVector)
-                            if (resolvedEmbeddings) {
-                                const vector = await resolvedEmbeddings.embedQuery(singleQuery)
-                                results = await collection.query.nearVector(
-                                    vector,
-                                    {
-                                        limit: parseInt(topK) || 5,
-                                        returnMetadata: returnMetadata as any,
-                                        returnProperties: returnFields.length > 0 ? returnFields : undefined
-                                    }
-                                )
+                            // Similarity Search
+                            if (additionalHeaders) {
+                                // Use collection's vectorizer via headers (e.g., X-OpenAI-Api-Key)
+                                results = await collection.query.nearText(singleQuery, {
+                                    limit: parseInt(topK) || 5,
+                                    returnMetadata: returnMetadata as any,
+                                    returnProperties: returnFields.length > 0 ? returnFields : undefined
+                                })
                             } else {
-                                // NearText (BM25)
-                                results = await collection.query.bm25(
-                                    singleQuery,
-                                    {
-                                        limit: parseInt(topK) || 5,
-                                        returnMetadata: returnMetadata as any,
-                                        returnProperties: returnFields.length > 0 ? returnFields : undefined
-                                    }
-                                )
+                                // BM25 keyword search only
+                                results = await collection.query.bm25(singleQuery, {
+                                    limit: parseInt(topK) || 5,
+                                    returnMetadata: returnMetadata as any,
+                                    returnProperties: returnFields.length > 0 ? returnFields : undefined
+                                })
                             }
                         }
 
@@ -427,87 +401,7 @@ class Weaviate_Tools implements INode {
                         }
                     })
 
-                    let finalResults = Array.from(uniqueResultsMap.values())
-
-                    // CHECK SECTION_HEADER LOGIC: Expand results to include all chunks from the same section
-                    const sectionCombos = new Set<string>()
-                    finalResults.forEach((item: any) => {
-                        const props = item.properties || {}
-                        if (props.section_header && props.file_path) {
-                            // Create a unique key for the combo
-                            sectionCombos.add(JSON.stringify({ header: props.section_header, path: props.file_path }))
-                        }
-                    })
-
-                    if (sectionCombos.size > 0) {
-                        const executeSectionFetch = async (comboStr: string) => {
-                            try {
-                                const { header, path } = JSON.parse(comboStr)
-                                const cleanIndex = weaviateIndex.replace(/^\*+|\*+$/g, '').replace(/^\/+|\/+$/g, '')
-                                const collection = client.collections.get(cleanIndex)
-
-                                // Helper function to clean field names
-                                const cleanFieldName = (fieldName: string): string => {
-                                    return fieldName.replace(/^\*+|\*+$/g, '').replace(/^\/+|\/+$/g, '')
-                                }
-
-                                // Determine which fields to return
-                                const returnFields: string[] = []
-                                if (fields) {
-                                    returnFields.push(...fields.split(',').map((f) => cleanFieldName(f.trim())))
-                                } else {
-                                    if (weaviateTextKey) returnFields.push(cleanFieldName(weaviateTextKey))
-                                    if (weaviateMetadataKeys) {
-                                        try {
-                                            const metas = JSON.parse(weaviateMetadataKeys.replace(/\s/g, ''))
-                                            if (Array.isArray(metas)) {
-                                                returnFields.push(...metas.map((m: string) => cleanFieldName(m)))
-                                            }
-                                        } catch (e) { }
-                                    }
-                                }
-
-                                // Fetch all objects with matching section_header and file_path
-                                // Note: In v3 client, multi-condition filters are done through the filter builder
-                                // For now, fetch without filter and filter in application code
-                                // TODO: Implement proper v3 filter with AND once API is confirmed
-                                const sectionResults = await collection.query.fetchObjects({
-                                    limit: 5,
-                                    returnMetadata: ['id', 'score', 'distance'] as any,
-                                    returnProperties: returnFields.length > 0 ? returnFields : undefined
-                                })
-
-                                // Filter results in application code
-                                const filtered = sectionResults?.objects?.filter((obj: any) => {
-                                    const props = obj.properties || {}
-                                    return props.section_header === header && props.file_path === path
-                                }) || []
-
-                                return filtered.map((obj: any) => {
-                                    return {
-                                        id: obj.uuid,
-                                        properties: obj.properties,
-                                        score: obj.metadata?.score ?? obj.metadata?.distance ?? null
-                                    }
-                                })
-                            } catch (e) {
-                                if (isDev) console.error('[Weaviate Tool] Section fetch error:', e)
-                                return []
-                            }
-                        }
-
-                        // Run section fetches in parallel
-                        const sectionResults = await Promise.all(Array.from(sectionCombos).map(executeSectionFetch))
-                        const flattenedSectionResults = sectionResults.flat()
-
-                        // Merge into final results (deduplicate again)
-                        flattenedSectionResults.forEach((item: any) => {
-                            if (item.id && !uniqueResultsMap.has(item.id)) {
-                                uniqueResultsMap.set(item.id, item)
-                                finalResults.push(item)
-                            }
-                        })
-                    }
+                    const finalResults = Array.from(uniqueResultsMap.values())
 
                     const output = {
                         query: query,
@@ -516,11 +410,8 @@ class Weaviate_Tools implements INode {
                         results: finalResults
                     }
 
-                    if (isDev) console.log('[Weaviate Tool] Final Output:', JSON.stringify(output, null, 2))
-
                     return JSON.stringify(output, null, 2)
                 } catch (error: any) {
-                    if (isDev) console.error('[Weaviate Tool] Error:', error)
                     return `Error searching Weaviate: ${error.message}`
                 }
             }

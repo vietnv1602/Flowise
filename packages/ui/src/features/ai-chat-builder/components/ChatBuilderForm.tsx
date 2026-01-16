@@ -1,13 +1,13 @@
 /**
  * ChatBuilderForm - Input Form Component
  *
- * Simple, clean form with integrated AI provider selector
+ * Simple, clean form with model selector from LLM Hub
  */
 
 import React, { useState, useRef, useEffect } from 'react'
-import { Box, Stack, FormControl, Select, MenuItem, Alert, IconButton } from '@mui/material'
+import { Box, Stack, FormControl, Select, MenuItem, Alert, IconButton, CircularProgress } from '@mui/material'
 import { IconArrowUp } from '@tabler/icons-react'
-import { ChatBuilderRequest, AIProvider } from '../types'
+import { ChatBuilderRequest } from '../types'
 
 export interface ChatBuilderFormProps {
     isGenerating?: boolean
@@ -18,12 +18,20 @@ export interface ChatBuilderFormProps {
     onCancel?: () => void
 }
 
-const PROVIDER_OPTIONS: Array<{ value: AIProvider; label: string }> = [
-    { value: 'openai', label: 'GPT-4' },
-    { value: 'anthropic', label: 'Claude' },
-    { value: 'google', label: 'Gemini' },
-    { value: 'cohere', label: 'Cohere' }
-]
+export interface LLMModel {
+    id: string
+    name: string
+    provider: string
+}
+
+export interface ProviderData {
+    id: string
+    name: string
+    displayName: string
+    models: LLMModel[]
+    requiresCredential: boolean
+    defaultModel?: string
+}
 
 /**
  * Chat Builder Form Component
@@ -36,8 +44,46 @@ export const ChatBuilderForm: React.FC<ChatBuilderFormProps> = ({
     onSubmit
 }) => {
     const [description, setDescription] = useState('')
-    const [provider, setProvider] = useState<AIProvider>('openai')
+    const [providers, setProviders] = useState<ProviderData[]>([])
+    const [allModels, setAllModels] = useState<Array<LLMModel & { providerName: string }>>([])
+    const [selectedModel, setSelectedModel] = useState<string>('')
+    const [isLoadingModels, setIsLoadingModels] = useState(true)
     const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+    // Fetch providers and models on mount
+    useEffect(() => {
+        const fetchProviders = async () => {
+            setIsLoadingModels(true)
+            try {
+                const response = await fetch('/api/v1/chat-builder/providers')
+                if (response.ok) {
+                    const data = await response.json()
+                    const providersData: ProviderData[] = data.providers || []
+                    setProviders(providersData)
+
+                    // Flatten all models into one list
+                    const models = providersData.flatMap((provider) =>
+                        provider.models.map((model) => ({
+                            ...model,
+                            providerName: provider.displayName
+                        }))
+                    )
+                    setAllModels(models)
+
+                    // Select first model by default
+                    if (models.length > 0) {
+                        setSelectedModel(models[0].id)
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to fetch providers:', error)
+            } finally {
+                setIsLoadingModels(false)
+            }
+        }
+
+        fetchProviders()
+    }, [])
 
     // Auto-focus input when component mounts or not disabled
     useEffect(() => {
@@ -47,12 +93,13 @@ export const ChatBuilderForm: React.FC<ChatBuilderFormProps> = ({
     }, [disabled, isGenerating])
 
     const handleSubmit = async () => {
-        if (!description.trim() || isGenerating) return
+        if (!description.trim() || isGenerating || !selectedModel) return
 
         const request: ChatBuilderRequest = {
             description: description.trim(),
-            selectedProvider: provider,
+            selectedProvider: 'llmhub',
             flowType: isAgentCanvas ? 'agentflow' : 'chatflow',
+            model: selectedModel,
             requirements: {
                 complexity: 'medium',
                 tone: 'professional'
@@ -60,7 +107,6 @@ export const ChatBuilderForm: React.FC<ChatBuilderFormProps> = ({
         }
 
         // Store current description and clear input immediately
-        // The message is already captured in request and will be added to chat by the hook
         const currentDescription = description.trim()
         setDescription('')
 
@@ -97,7 +143,7 @@ export const ChatBuilderForm: React.FC<ChatBuilderFormProps> = ({
                 </Alert>
             )}
 
-            {/* Input Area with Provider and Send Button */}
+            {/* Input Area with Model and Send Button */}
             <Box
                 sx={{
                     display: 'flex',
@@ -117,7 +163,7 @@ export const ChatBuilderForm: React.FC<ChatBuilderFormProps> = ({
                     }
                 }}
             >
-                {/* Text Input - Native textarea with proper contrast */}
+                {/* Text Input */}
                 <Box
                     sx={{
                         position: 'relative',
@@ -155,43 +201,67 @@ export const ChatBuilderForm: React.FC<ChatBuilderFormProps> = ({
                     />
                 </Box>
 
-                {/* Bottom Row: Provider and Send Button */}
+                {/* Bottom Row: Model Selector and Send Button */}
                 <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 0.5 }}>
-                    {/* Provider Selector */}
-                    <FormControl size='small' disabled={isGenerating || disabled}>
-                        <Select
-                            value={provider}
-                            onChange={(e) => setProvider(e.target.value as AIProvider)}
-                            sx={{
-                                width: 100,
-                                height: 32,
-                                fontSize: '0.75rem',
-                                bgcolor: 'background.paper',
-                                '& .MuiSelect-select': {
-                                    py: 0.5,
-                                    fontSize: '0.75rem'
-                                }
-                            }}
-                        >
-                            {PROVIDER_OPTIONS.map((option) => (
-                                <MenuItem key={option.value} value={option.value} sx={{ fontSize: '0.75rem' }}>
-                                    {option.label}
-                                </MenuItem>
-                            ))}
-                        </Select>
-                    </FormControl>
+                    {/* Model Selector */}
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        {isLoadingModels && <CircularProgress size={14} sx={{ ml: 0.5 }} />}
+
+                        <FormControl size='small' disabled={isGenerating || disabled}>
+                            <Select
+                                value={selectedModel}
+                                onChange={(e) => setSelectedModel(e.target.value)}
+                                displayEmpty
+                                MenuProps={{
+                                    sx: {
+                                        zIndex: 14000,
+                                        '& .MuiMenu-paper': {
+                                            maxHeight: 400,
+                                            zIndex: 14000
+                                        }
+                                    },
+                                    anchorOrigin: {
+                                        vertical: 'bottom',
+                                        horizontal: 'left'
+                                    },
+                                    transformOrigin: {
+                                        vertical: 'top',
+                                        horizontal: 'left'
+                                    },
+                                    disableScrollLock: true
+                                }}
+                                sx={{
+                                    width: 250,
+                                    height: 32,
+                                    fontSize: '0.75rem',
+                                    bgcolor: 'background.paper',
+                                    '& .MuiSelect-select': {
+                                        py: 0.5,
+                                        fontSize: '0.75rem'
+                                    }
+                                }}
+                            >
+                                {allModels.map((model) => (
+                                    <MenuItem key={model.id} value={model.id} sx={{ fontSize: '0.75rem', py: 0.5 }}>
+                                        {model.name}
+                                    </MenuItem>
+                                ))}
+                            </Select>
+                        </FormControl>
+                    </Box>
 
                     {/* Send Button */}
                     <IconButton
                         type='button'
                         onClick={handleSubmit}
-                        disabled={!description.trim() || isGenerating || disabled}
+                        disabled={!description.trim() || isGenerating || disabled || !selectedModel}
                         sx={{
                             width: 36,
                             height: 36,
                             flexShrink: 0,
                             borderRadius: 1.5,
-                            background: !description.trim() || isGenerating || disabled ? 'action.disabled' : 'primary.main',
+                            background:
+                                !description.trim() || isGenerating || disabled || !selectedModel ? 'action.disabled' : 'primary.main',
                             color: 'white',
                             transition: 'all 0.2s ease',
                             '&:hover:not(:disabled)': {

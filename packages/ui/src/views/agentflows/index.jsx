@@ -93,11 +93,25 @@ const Agentflows = () => {
         )
     }
 
-    const addNew = () => {
-        if (agentflowVersion === 'v2') {
-            navigate('/v2/agentcanvas')
-        } else {
-            navigate('/agentcanvas')
+    const addNew = async () => {
+        try {
+            const body = {
+                name: agentflowVersion === 'v2' ? 'Untitled Agentflow' : 'Untitled Multi-Agent',
+                type: agentflowVersion === 'v2' ? 'AGENTFLOW' : 'MULTIAGENT',
+                flowData: JSON.stringify({ nodes: [], edges: [] })
+            }
+            const createResp = await chatflowsApi.createNewChatflow(body)
+            if (createResp.data) {
+                if (agentflowVersion === 'v2') {
+                    navigate(`/v2/agentcanvas/${createResp.data.id}`)
+                } else {
+                    navigate(`/agentcanvas/${createResp.data.id}`)
+                }
+            }
+        } catch (error) {
+            console.error(error)
+            const errorMsg = error.response?.data?.message || 'Failed to create agentflow'
+            setError({ message: errorMsg })
         }
     }
 

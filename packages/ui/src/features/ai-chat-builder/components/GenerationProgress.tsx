@@ -6,7 +6,7 @@
 
 import React from 'react'
 import { Box, LinearProgress, Typography, Chip } from '@mui/material'
-import { GenerationProgress as ProgressType } from '../types'
+import { GenerationProgressState as ProgressType } from '../types'
 
 export interface GenerationProgressProps {
     progress: ProgressType

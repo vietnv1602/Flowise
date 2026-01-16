@@ -81,8 +81,22 @@ const Chatflows = () => {
         )
     }
 
-    const addNew = () => {
-        navigate('/canvas')
+    const addNew = async () => {
+        try {
+            const body = {
+                name: 'Untitled Chatflow',
+                type: 'CHATFLOW',
+                flowData: JSON.stringify({ nodes: [], edges: [] })
+            }
+            const createResp = await chatflowsApi.createNewChatflow(body)
+            if (createResp.data) {
+                navigate(`/canvas/${createResp.data.id}`)
+            }
+        } catch (error) {
+            console.error(error)
+            const errorMsg = error.response?.data?.message || 'Failed to create chatflow'
+            setError({ message: errorMsg })
+        }
     }
 
     const goToCanvas = (selectedChatflow) => {

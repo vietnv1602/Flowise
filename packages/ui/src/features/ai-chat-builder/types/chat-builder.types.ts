@@ -15,6 +15,7 @@ export interface ChatBuilderRequest {
     selectedProvider: AIProvider
     credentialId?: string
     flowType?: 'chatflow' | 'agentflow'
+    model?: string // Model ID from LLM Hub
 }
 
 /**
@@ -30,7 +31,7 @@ export interface ChatBuilderRequirements {
 /**
  * Supported AI providers
  */
-export type AIProvider = 'openai' | 'anthropic' | 'azure-openai' | 'cohere' | 'google' | 'custom'
+export type AIProvider = 'openai' | 'anthropic' | 'azure-openai' | 'cohere' | 'google' | 'custom' | 'llmhub'
 
 /**
  * Response from flow generation
@@ -94,7 +95,7 @@ export interface GeneratedEdge {
 export interface ChatBuilderState {
     isOpen: boolean
     isGenerating: boolean
-    progress: GenerationProgress
+    progress: GenerationProgressState
     error: string | null
     result: ChatBuilderResponse | null
     selectedProvider: AIProvider
@@ -103,7 +104,7 @@ export interface ChatBuilderState {
 /**
  * Progress tracking during generation
  */
-export interface GenerationProgress {
+export interface GenerationProgressState {
     stage: GenerationStage
     currentStep: number
     totalSteps: number
@@ -193,4 +194,23 @@ export interface CredentialInfo {
     name: string
     provider: AIProvider
     isSelected: boolean
+}
+
+/**
+ * Conversation information
+ */
+export interface Conversation {
+    conversationId: string
+    flowId: string
+    flowType: 'chatflow' | 'agentflow'
+    title: string
+    createdAt: Date
+    updatedAt: Date
+}
+
+/**
+ * Conversation detail with messages
+ */
+export interface ConversationDetail extends Conversation {
+    messages: ChatMessage[]
 }

@@ -5,13 +5,10 @@
  * Manages state and provides methods for flow generation.
  */
 
-import { useState, useCallback, useRef, useEffect } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import { useSnackbar } from 'notistack'
-import { ChatBuilderRequest, ChatBuilderResponse, ChatBuilderState, GenerationStage, ChatMessage } from '../types'
+import { ChatBuilderRequest, ChatBuilderResponse, ChatBuilderState, ChatMessage } from '../types'
 import { getChatBuilderService } from '../services/ChatBuilderService'
-import { PHASE_PROMPTS } from '../utils/promptTemplates'
-
-const INITIAL_STAGES: GenerationStage[] = ['discovery', 'exploration', 'clarifying', 'architecture', 'implementation', 'review']
 
 /**
  * Hook return type
@@ -27,6 +24,9 @@ export interface UseChatBuilderReturn {
     generateFlow: (request: ChatBuilderRequest) => Promise<ChatBuilderResponse | null>
     cancelGeneration: () => void
     reset: () => void
+    clearMessages: () => void
+    loadMessages: (messages: ChatMessage[]) => void
+    chat: (message: string, flowId: string, flowType: 'chatflow' | 'agentflow', model?: string, sessionId?: string, onSessionId?: (sessionId: string) => void) => Promise<void>
 
     // Helpers
     isReady: boolean
@@ -36,7 +36,17 @@ export interface UseChatBuilderReturn {
 /**
  * Main chat builder hook
  */
-export function useChatBuilder(): UseChatBuilderReturn {
+export interface UseChatBuilderProps {
+    chatflowId?: string
+    isAgentCanvas?: boolean
+    onFlowGenerated?: (flowData: any) => void
+}
+
+export function useChatBuilder({
+    chatflowId,
+    isAgentCanvas,
+    onFlowGenerated
+}: UseChatBuilderProps = {}): UseChatBuilderReturn {
     const { enqueueSnackbar } = useSnackbar()
     const service = useRef(getChatBuilderService())
 
@@ -46,7 +56,7 @@ export function useChatBuilder(): UseChatBuilderReturn {
         progress: {
             stage: 'idle',
             currentStep: 0,
-            totalSteps: INITIAL_STAGES.length,
+            totalSteps: 1,
             message: ''
         },
         error: null,
@@ -63,76 +73,18 @@ export function useChatBuilder(): UseChatBuilderReturn {
         }
     ])
 
-    const [isReady, setIsReady] = useState(false)
+    const [isReady, setIsReady] = useState(true)
 
-    // Check service readiness on mount
-    useEffect(() => {
-        if (service.current) {
-            service.current
-                .isReady()
-                .then(setIsReady)
-                .catch(() => setIsReady(false))
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [])
-
-    /**
-     * Open the chat builder panel
-     */
     const openPanel = useCallback(() => {
         setState((prev) => ({ ...prev, isOpen: true }))
     }, [])
 
-    /**
-     * Close the chat builder panel
-     */
     const closePanel = useCallback(() => {
         setState((prev) => ({ ...prev, isOpen: false }))
     }, [])
 
-    /**
-     * Simulate progress through the feature-dev phases
-     */
-    const simulateProgress = useCallback(async (_request: ChatBuilderRequest): Promise<void> => {
-        const stages = INITIAL_STAGES
-
-        for (let i = 0; i < stages.length; i++) {
-            const stage = stages[i]
-            const phaseInfo = PHASE_PROMPTS[stage]
-
-            setState((prev) => ({
-                ...prev,
-                progress: {
-                    stage,
-                    currentStep: i + 1,
-                    totalSteps: stages.length,
-                    message: phaseInfo.instruction
-                }
-            }))
-
-            // Add phase message to chat if it has questions
-            if (phaseInfo.questions.length > 0) {
-                const questionMessage: ChatMessage = {
-                    id: `phase_${stage}`,
-                    role: 'assistant',
-                    content: `**${phaseInfo.instruction}**\n\n${phaseInfo.questions.join('\n')}`,
-                    timestamp: new Date()
-                }
-                setMessages((prev) => [...prev, questionMessage])
-            }
-
-            // Simulate processing time (progressive delays)
-            const delay = Math.min(500 + i * 300, 2000)
-            await new Promise((resolve) => setTimeout(resolve, delay))
-        }
-    }, [])
-
-    /**
-     * Generate a flow
-     */
     const generateFlow = useCallback(
         async (request: ChatBuilderRequest): Promise<ChatBuilderResponse | null> => {
-            // Add user message
             const userMessage: ChatMessage = {
                 id: `user_${Date.now()}`,
                 role: 'user',
@@ -141,66 +93,95 @@ export function useChatBuilder(): UseChatBuilderReturn {
             }
             setMessages((prev) => [...prev, userMessage])
 
-            // Reset state
             setState((prev) => ({
                 ...prev,
                 isGenerating: true,
                 error: null,
                 result: null,
-                selectedProvider: request.selectedProvider
+                selectedProvider: request.selectedProvider,
+                progress: {
+                    stage: 'implementation',
+                    currentStep: 1,
+                    totalSteps: 1,
+                    message: 'Chatting...'
+                }
             }))
 
+            const assistantMessageId = `assistant_${Date.now()}`
+            const assistantMessage: ChatMessage = {
+                id: assistantMessageId,
+                role: 'assistant',
+                content: '',
+                timestamp: new Date()
+            }
+            setMessages((prev) => [...prev, assistantMessage])
+
             try {
-                // Run through the phases
-                await simulateProgress(request)
-
-                // Set implementation stage
-                setState((prev) => ({
-                    ...prev,
-                    progress: {
-                        stage: 'implementation',
-                        currentStep: INITIAL_STAGES.length,
-                        totalSteps: INITIAL_STAGES.length,
-                        message: 'Generating flow structure...'
-                    }
-                }))
-
-                // Call the service
                 if (!service.current) {
                     throw new Error('Service not initialized')
                 }
-                const response = await service.current.generateFlow(request)
 
-                // Update state with result
+                let fullResponse = ''
+
+                await service.current.chatStream(
+                    request.description,
+                    request.model || 'gpt-4o-mini',
+                    chatflowId || 'default',
+                    isAgentCanvas ? 'agentflow' : 'chatflow',
+                    undefined,
+                    (chunk: string) => {
+                        fullResponse += chunk
+                        setMessages((prev) =>
+                            prev.map((msg) =>
+                                msg.id === assistantMessageId
+                                    ? { ...msg, content: fullResponse }
+                                    : msg
+                            )
+                        )
+                    },
+                    () => {
+                        setMessages((prev) =>
+                            prev.map((msg) =>
+                                msg.id === assistantMessageId
+                                    ? { ...msg, content: fullResponse }
+                                    : msg
+                            )
+                        )
+                    },
+                    (error: string) => {
+                        throw new Error(error)
+                    }
+                )
+
                 setState((prev) => ({
                     ...prev,
                     isGenerating: false,
                     progress: {
                         stage: 'complete',
-                        currentStep: INITIAL_STAGES.length,
-                        totalSteps: INITIAL_STAGES.length,
-                        message: 'Flow generated successfully!'
-                    },
-                    result: response
+                        currentStep: 1,
+                        totalSteps: 1,
+                        message: 'Chat completed!'
+                    }
                 }))
 
-                // Add assistant message with result
-                const assistantMessage: ChatMessage = {
-                    id: `assistant_${Date.now()}`,
-                    role: 'assistant',
-                    content: generateSuccessMessage(response),
-                    timestamp: new Date()
-                }
-                setMessages((prev) => [...prev, assistantMessage])
-
-                // Show success notification
-                enqueueSnackbar(`Flow generated with ${response.nodes.length} nodes and ${response.edges.length} edges`, {
+                enqueueSnackbar('Response received', {
                     variant: 'success'
                 })
 
-                return response
+                return {
+                    flowData: { nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 } },
+                    metadata: {
+                        provider: request.selectedProvider || 'llmhub',
+                        model: request.model || 'gpt-4o-mini',
+                        tokensUsed: fullResponse.length,
+                        timestamp: new Date(),
+                        version: '1.0.0'
+                    },
+                    nodes: [],
+                    edges: []
+                }
             } catch (error: any) {
-                const errorMessage = error.message || 'Failed to generate flow'
+                const errorMessage = error.message || 'Failed to get response'
 
                 setState((prev) => ({
                     ...prev,
@@ -208,33 +189,31 @@ export function useChatBuilder(): UseChatBuilderReturn {
                     progress: {
                         stage: 'error',
                         currentStep: 0,
-                        totalSteps: INITIAL_STAGES.length,
+                        totalSteps: 1,
                         message: errorMessage
                     },
                     error: errorMessage
                 }))
 
-                // Add error message to chat
-                const errorChatMessage: ChatMessage = {
-                    id: `error_${Date.now()}`,
-                    role: 'assistant',
-                    content: `I encountered an error: ${errorMessage}\n\nWould you like to try again or modify your request?`,
-                    timestamp: new Date()
-                }
-                setMessages((prev) => [...prev, errorChatMessage])
+                setMessages((prev) =>
+                    prev.map((msg) =>
+                        msg.id === assistantMessageId
+                            ? {
+                                ...msg,
+                                content: `I encountered an error: ${errorMessage}\n\nWould you like to try again?`
+                            }
+                            : msg
+                    )
+                )
 
-                // Show error notification
                 enqueueSnackbar(errorMessage, { variant: 'error' })
 
                 return null
             }
         },
-        [simulateProgress, enqueueSnackbar]
+        [enqueueSnackbar, chatflowId, isAgentCanvas]
     )
 
-    /**
-     * Cancel ongoing generation
-     */
     const cancelGeneration = useCallback(() => {
         service.current.cancelGeneration()
         setState((prev) => ({
@@ -243,7 +222,7 @@ export function useChatBuilder(): UseChatBuilderReturn {
             progress: {
                 stage: 'idle',
                 currentStep: 0,
-                totalSteps: INITIAL_STAGES.length,
+                totalSteps: 1,
                 message: 'Generation cancelled'
             }
         }))
@@ -251,9 +230,6 @@ export function useChatBuilder(): UseChatBuilderReturn {
         enqueueSnackbar('Generation cancelled', { variant: 'info' })
     }, [enqueueSnackbar])
 
-    /**
-     * Reset the chat builder state
-     */
     const reset = useCallback(() => {
         setState({
             isOpen: false,
@@ -261,7 +237,7 @@ export function useChatBuilder(): UseChatBuilderReturn {
             progress: {
                 stage: 'idle',
                 currentStep: 0,
-                totalSteps: INITIAL_STAGES.length,
+                totalSteps: 1,
                 message: ''
             },
             error: null,
@@ -278,9 +254,137 @@ export function useChatBuilder(): UseChatBuilderReturn {
         ])
     }, [])
 
-    /**
-     * Check if generation is possible
-     */
+    const clearMessages = useCallback(() => {
+        setMessages([
+            {
+                id: 'welcome',
+                role: 'assistant',
+                content: getWelcomeMessage(),
+                timestamp: new Date()
+            }
+        ])
+    }, [])
+
+    const loadMessages = useCallback((newMessages: ChatMessage[]) => {
+        setMessages(newMessages)
+    }, [])
+
+    const chat = useCallback(
+        async (message: string, flowId: string, flowType: 'chatflow' | 'agentflow', model: string = 'gpt-4o-mini', sessionId?: string, onSessionId?: (sessionId: string) => void) => {
+            const userMessage: ChatMessage = {
+                id: `user_${Date.now()}`,
+                role: 'user',
+                content: message,
+                timestamp: new Date()
+            }
+            setMessages((prev) => [...prev, userMessage])
+
+            setState((prev) => ({
+                ...prev,
+                isGenerating: true,
+                error: null,
+                progress: {
+                    stage: 'implementation',
+                    currentStep: 1,
+                    totalSteps: 1,
+                    message: 'Chatting...'
+                }
+            }))
+
+            const assistantMessageId = `assistant_${Date.now()}`
+            const assistantMessage: ChatMessage = {
+                id: assistantMessageId,
+                role: 'assistant',
+                content: '',
+                timestamp: new Date()
+            }
+            setMessages((prev) => [...prev, assistantMessage])
+
+            try {
+                if (!service.current) {
+                    throw new Error('Service not initialized')
+                }
+
+                let fullResponse = ''
+
+                await service.current.chatStream(
+                    message,
+                    model,
+                    flowId,
+                    flowType,
+                    sessionId,
+                    (chunk: string) => {
+                        fullResponse += chunk
+                        setMessages((prev) =>
+                            prev.map((msg) =>
+                                msg.id === assistantMessageId
+                                    ? { ...msg, content: fullResponse }
+                                    : msg
+                            )
+                        )
+                    },
+                    () => {
+                        setMessages((prev) =>
+                            prev.map((msg) =>
+                                msg.id === assistantMessageId
+                                    ? { ...msg, content: fullResponse }
+                                    : msg
+                            )
+                        )
+                    },
+                    (error: string) => {
+                        throw new Error(error)
+                    },
+                    (sessionId: string) => {
+                        onSessionId?.(sessionId)
+                    }
+                )
+
+                setState((prev) => ({
+                    ...prev,
+                    isGenerating: false,
+                    progress: {
+                        stage: 'complete',
+                        currentStep: 1,
+                        totalSteps: 1,
+                        message: 'Chat completed!'
+                    }
+                }))
+
+                enqueueSnackbar('Response received', { variant: 'success' })
+            } catch (error: any) {
+                const errorMessage = error.message || 'Failed to get response'
+
+                setState((prev) => ({
+                    ...prev,
+                    isGenerating: false,
+                    progress: {
+                        stage: 'error',
+                        currentStep: 0,
+                        totalSteps: 1,
+                        message: errorMessage
+                    },
+                    error: errorMessage
+                }))
+
+                setMessages((prev) =>
+                    prev.map((msg) =>
+                        msg.id === assistantMessageId
+                            ? {
+                                ...msg,
+                                content: `I encountered an error: ${errorMessage}\n\nWould you like to try again?`
+                            }
+                            : msg
+                    )
+                )
+
+                enqueueSnackbar(errorMessage, { variant: 'error' })
+            }
+        },
+        [enqueueSnackbar]
+    )
+
+    const isReadyComp = isReady // rename to avoid conflict if any, though isReady state is fine
     const canGenerate = state.isGenerating === false && isReady === true
 
     return {
@@ -291,11 +395,13 @@ export function useChatBuilder(): UseChatBuilderReturn {
         generateFlow,
         cancelGeneration,
         reset,
+        clearMessages,
+        loadMessages,
+        chat,
         isReady,
         canGenerate
     }
 }
-
 /**
  * Get welcome message
  */
@@ -321,19 +427,4 @@ What would you like to build today?`
 /**
  * Generate success message
  */
-function generateSuccessMessage(response: ChatBuilderResponse): string {
-    return `I've generated your flow successfully! 🎉
 
-**Generated Flow:**
-- **Nodes:** ${response.nodes.length}
-- **Edges:** ${response.edges.length}
-- **Provider:** ${response.metadata.provider}
-- **Model:** ${response.metadata.model}
-
-**Next Steps:**
-1. Review the generated flow in the canvas
-2. Make any adjustments needed
-3. Save and deploy your flow
-
-The flow has been automatically loaded into the canvas for you.`
-}
