@@ -74,7 +74,11 @@ export const ChatBuilderPanel: React.FC<ChatBuilderPanelProps> = ({
 }) => {
     const theme = useTheme()
     const isMobile = useMediaQuery(theme.breakpoints.down('md'))
-    const { state, messages, generateFlow, reset, closePanel, isReady, clearMessages, loadMessages, chat } = useChatBuilder()
+    const { state, messages, generateFlow, reset, closePanel, isReady, clearMessages, loadMessages, chat } = useChatBuilder({
+        chatflowId: _chatflowId,
+        isAgentCanvas,
+        onFlowGenerated
+    })
 
     // Replace URL params with local state to prevent history stack issues
     const [chatConversationId, setChatConversationId] = useState<string | null>(null)
@@ -177,19 +181,15 @@ export const ChatBuilderPanel: React.FC<ChatBuilderPanelProps> = ({
             const detail = await service.getConversationDetail(conversationId)
 
             if (detail && detail.messages) {
-                const mappedMessages = detail.messages.map((msg: any) => {
-                    // Map LangChain roles to UI roles
-                    let role = msg.role || msg.type || 'user'
-                    if (role === 'ai') role = 'assistant'
-                    if (role === 'human') role = 'user'
-
-                    return {
-                        id: msg.id || Date.now().toString(),
-                        role,
-                        content: msg.content || msg.message || '',
-                        timestamp: msg.createdDate ? new Date(msg.createdDate) : new Date()
-                    }
-                })
+                console.log('[ChatBuilder] Loaded messages:', detail.messages)
+                const mappedMessages = detail.messages.map((msg: any) => ({
+                    id: msg.id || `${Date.now()}_${Math.random()}`,
+                    role: msg.role === 'ai' ? 'assistant' : (msg.role === 'human' ? 'user' : (msg.role || 'user')),
+                    content: msg.content || msg.message || '',
+                    timestamp: msg.createdDate ? new Date(msg.createdDate) : new Date()
+                }))
+                // Explicitly clear first (though loadMessages replaces) just to be safe visually
+                clearMessages()
                 loadMessages(mappedMessages)
 
                 // Update state if not already matching

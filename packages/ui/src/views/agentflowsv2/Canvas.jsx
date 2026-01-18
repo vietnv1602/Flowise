@@ -94,8 +94,8 @@ const AgentflowCanvas = () => {
 
     // ==============================|| ReactFlow ||============================== //
 
-    const [nodes, setNodes, onNodesChange] = useNodesState()
-    const [edges, setEdges, onEdgesChange] = useEdgesState()
+    const [nodes, setNodes, onNodesChange] = useNodesState([])
+    const [edges, setEdges, onEdgesChange] = useEdgesState([])
 
     const [selectedNode, setSelectedNode] = useState(null)
     const [isSyncNodesButtonEnabled, setIsSyncNodesButtonEnabled] = useState(false)
@@ -641,27 +641,34 @@ const AgentflowCanvas = () => {
     const [chatPopupOpen, setChatPopupOpen] = useState(false)
 
     useEffect(() => {
-        if (!chatflowId && !localStorage.getItem('duplicatedFlowData') && getNodesApi.data && nodes.length === 0) {
-            const startNodeData = getNodesApi.data.find((node) => node.name === 'startAgentflow')
-            if (startNodeData) {
-                const clonedStartNodeData = cloneDeep(startNodeData)
-                clonedStartNodeData.position = { x: 100, y: 100 }
-                const startNode = {
-                    id: 'startAgentflow_0',
-                    type: 'agentFlow',
-                    position: { x: 100, y: 100 },
-                    data: {
-                        ...initNode(clonedStartNodeData, 'startAgentflow_0', true),
-                        label: 'Start'
+        const isNewSession = !chatflowId && !localStorage.getItem('duplicatedFlowData')
+        const isLoadedSession = chatflowId && getSpecificChatflowApi.data
+
+        if ((isNewSession || isLoadedSession) && getNodesApi.data) {
+            const existingStartNode = nodes.find((node) => node.data && node.data.name === 'startAgentflow')
+            if (!existingStartNode) {
+                const startNodeData = getNodesApi.data.find((node) => node.name === 'startAgentflow')
+                if (startNodeData) {
+                    const clonedStartNodeData = cloneDeep(startNodeData)
+                    clonedStartNodeData.position = { x: 100, y: 100 }
+                    const startNode = {
+                        id: 'startAgentflow_0',
+                        type: 'agentFlow',
+                        position: { x: 100, y: 100 },
+                        data: {
+                            ...initNode(clonedStartNodeData, 'startAgentflow_0', true),
+                            label: 'Start'
+                        }
                     }
+                    setNodes((prevNodes) => [startNode, ...prevNodes])
+                    // Do not reset edges if we are just appending start node to existing flow
+                    if (!nodes.length) setEdges([])
                 }
-                setNodes([startNode])
-                setEdges([])
             }
         }
 
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [getNodesApi.data, chatflowId])
+    }, [getNodesApi.data, chatflowId, getSpecificChatflowApi.data, nodes])
 
     return (
         <>
@@ -776,6 +783,24 @@ const AgentflowCanvas = () => {
                                     show={editNodeDialogOpen}
                                     dialogProps={editNodeDialogProps}
                                     onCancel={() => setEditNodeDialogOpen(false)}
+                                />
+                                <CanvasAIButton
+                                    position="top-right"
+                                    chatflowId={chatflowId}
+                                    isAgentCanvas={true}
+                                    chatPopupOpen={chatPopupOpen}
+                                    onFlowGenerated={(flowData) => {
+                                        if (flowData.nodes) {
+                                            setNodes(flowData.nodes || [])
+                                        }
+                                        if (flowData.edges) {
+                                            setEdges(flowData.edges || [])
+                                        }
+                                        if (flowData.viewport) {
+                                            reactFlowInstance?.setViewport(flowData.viewport)
+                                        }
+                                        setTimeout(() => setDirty(), 0)
+                                    }}
                                 />
                                 {isSyncNodesButtonEnabled && (
                                     <Fab

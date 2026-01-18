@@ -56,7 +56,8 @@ const chatStream = async (req: Request, res: Response, next: NextFunction) => {
             {
                 model,
                 messages: [{ role: 'user', content: message }],
-                temperature: 0.7
+                temperature: 0.7,
+                flowType
             },
             convId,
             // onChunk

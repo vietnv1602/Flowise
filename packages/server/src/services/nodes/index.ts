@@ -11,13 +11,45 @@ import { OMIT_QUEUE_JOB_DATA } from '../../utils/constants'
 import { executeCustomNodeFunction } from '../../utils/executeCustomNodeFunction'
 
 // Get all component nodes
-const getAllNodes = async () => {
+const getAllNodes = async (filters: { flowType?: string } = {}) => {
     try {
         const appServer = getRunningExpressApp()
         const dbResponse = []
+        const { flowType } = filters
+        const normalizedFlowType = (flowType || '').toLowerCase()
+
+        // Strict Allow Lists for Agentflow
+        const COMMON_CATEGORIES = ['Tools', 'Chat Models', 'MCP']
+
         for (const nodeName in appServer.nodesPool.componentNodes) {
-            const clonedNode = cloneDeep(appServer.nodesPool.componentNodes[nodeName])
-            dbResponse.push(clonedNode)
+            const componentNode = appServer.nodesPool.componentNodes[nodeName]
+            const clonedNode = cloneDeep(componentNode)
+
+            // Filter Logic if flowType is provided
+            if (normalizedFlowType === 'agentflow') {
+                const filePath = (clonedNode.filePath || '').toLowerCase()
+                const category = (clonedNode.category || '')
+
+                // Strict "Hard" Classification based on File Path
+                const isAgentSpecificNode =
+                    filePath.includes('/agentflow/') ||
+                    filePath.includes('\\agentflow\\') ||
+                    filePath.includes('/sequentialagents/') ||
+                    filePath.includes('\\sequentialagents\\') ||
+                    filePath.includes('/multiagents/') ||
+                    filePath.includes('\\multiagents\\')
+
+                // Allow if:
+                // 1. Is Agent Specific Node (hard path check)
+                // 2. OR is in Common Categories (Tools, Chat Models)
+                const isCommon = COMMON_CATEGORIES.some(c => c.toLowerCase() === category.toLowerCase())
+
+                if (isAgentSpecificNode || isCommon) {
+                    dbResponse.push(clonedNode)
+                }
+            } else {
+                dbResponse.push(clonedNode)
+            }
         }
         return dbResponse
     } catch (error) {

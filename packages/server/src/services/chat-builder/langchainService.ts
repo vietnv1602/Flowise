@@ -14,9 +14,11 @@ import { BaseChatMessageHistory } from '@langchain/core/chat_history'
 import { MongoDBChatMessageHistory } from '@langchain/mongodb'
 import { MongoClient } from 'mongodb'
 import { z } from 'zod'
+import { isEqual } from 'lodash'
 import logger from '../../utils/logger'
 import { InternalFlowiseError } from '../../errors/internalFlowiseError'
 import { StatusCodes } from 'http-status-codes'
+import nodesService from '../nodes'
 
 // ============================================================================
 // Types and Interfaces
@@ -34,6 +36,7 @@ export interface LangChainRequestOptions {
     temperature?: number
     max_tokens?: number
     conversationId?: string // For memory management
+    flowType?: 'chatflow' | 'agentflow'
 }
 
 // ============================================================================
@@ -305,6 +308,510 @@ class LangChainService {
     // 4. Streaming Chat with Memory
     // ========================================================================
 
+    // ========================================================================
+    // Node Initialization Helpers (ported from genericHelper.js)
+    // ========================================================================
+
+    /**
+     * Initialize default values for node inputs
+     */
+    private initializeDefaultNodeData(nodeParams: any[]): Record<string, any> {
+        const initialValues: Record<string, any> = {}
+
+        for (const input of nodeParams) {
+            initialValues[input.name] = input.default !== undefined ? input.default : ''
+        }
+
+        return initialValues
+    }
+
+    /**
+     * Create output anchors for agentflow
+     */
+    private createAgentFlowOutputs(nodeData: any, newNodeId: string): any[] {
+        if (nodeData.hideOutput) return []
+
+        if (nodeData.outputs?.length) {
+            return nodeData.outputs.map((_: any, index: number) => ({
+                id: `${newNodeId}-output-${index}`,
+                label: nodeData.label,
+                name: nodeData.name
+            }))
+        }
+
+        return [
+            {
+                id: `${newNodeId}-output-${nodeData.name}`,
+                label: nodeData.label,
+                name: nodeData.name
+            }
+        ]
+    }
+
+    /**
+     * Create output option for standard outputs
+     */
+    private createOutputOption(output: any, newNodeId: string): any {
+        const outputBaseClasses = output.baseClasses ?? []
+        const baseClasses = outputBaseClasses.length > 1 ? outputBaseClasses.join('|') : outputBaseClasses[0] || ''
+        const type = outputBaseClasses.length > 1 ? outputBaseClasses.join(' | ') : outputBaseClasses[0] || ''
+
+        return {
+            id: `${newNodeId}-output-${output.name}-${baseClasses}`,
+            name: output.name,
+            label: output.label,
+            description: output.description ?? '',
+            type,
+            isAnchor: output?.isAnchor,
+            hidden: output?.hidden
+        }
+    }
+
+    /**
+     * Create standard outputs for chatflow
+     */
+    private createStandardOutputs(nodeData: any, newNodeId: string): any[] {
+        if (nodeData.hideOutput) return []
+
+        if (nodeData.outputs?.length) {
+            const outputOptions = nodeData.outputs.map((output: any) => this.createOutputOption(output, newNodeId))
+
+            return [
+                {
+                    name: 'output',
+                    label: 'Output',
+                    type: 'options',
+                    description: nodeData.outputs[0].description ?? '',
+                    options: outputOptions,
+                    default: nodeData.outputs[0].name
+                }
+            ]
+        }
+
+        return [
+            {
+                id: `${newNodeId}-output-${nodeData.name}-${nodeData.baseClasses.join('|')}`,
+                name: nodeData.name,
+                label: nodeData.type,
+                description: nodeData.description ?? '',
+                type: nodeData.baseClasses.join(' | ')
+            }
+        ]
+    }
+
+    /**
+     * Initialize output anchors based on flow type
+     */
+    private initializeOutputAnchors(nodeData: any, newNodeId: string, isAgentflow: boolean): any[] {
+        return isAgentflow ? this.createAgentFlowOutputs(nodeData, newNodeId) : this.createStandardOutputs(nodeData, newNodeId)
+    }
+
+    /**
+     * Apply show/hide logic to input params and anchors
+     */
+    private applyShowHideLogic(nodeData: any, params: any[], inputValues: Record<string, any>): any[] {
+        const processedParams: any[] = []
+
+        for (const inputParam of params) {
+            const param = { ...inputParam }
+            param.display = true
+
+            if (param.show) {
+                this.processShowHideConditions(nodeData, param, param.show, inputValues, true)
+            }
+            if (param.hide) {
+                this.processShowHideConditions(nodeData, param, param.hide, inputValues, false)
+            }
+
+            processedParams.push(param)
+        }
+
+        return processedParams
+    }
+
+    /**
+     * Process show/hide conditions for a parameter
+     */
+    private processShowHideConditions(
+        _nodeData: any,
+        inputParam: any,
+        conditions: Record<string, any>,
+        inputValues: Record<string, any>,
+        isShow: boolean
+    ): void {
+        Object.keys(conditions).forEach((path) => {
+            const comparisonValue = conditions[path]
+            let groundValue = inputValues[path]
+
+            // Handle array values
+            if (groundValue && typeof groundValue === 'string' && groundValue.startsWith('[') && groundValue.endsWith(']')) {
+                try {
+                    groundValue = JSON.parse(groundValue)
+                } catch (e) {
+                    // Keep as string
+                }
+            }
+
+            if (Array.isArray(groundValue)) {
+                if (Array.isArray(comparisonValue)) {
+                    const hasIntersection = comparisonValue.some((val) => groundValue.includes(val))
+                    if (isShow && !hasIntersection) {
+                        inputParam.display = false
+                    }
+                    if (!isShow && hasIntersection) {
+                        inputParam.display = false
+                    }
+                } else if (typeof comparisonValue === 'string') {
+                    const matchFound = groundValue.some((val) => comparisonValue === val)
+                    if (isShow && !matchFound) {
+                        inputParam.display = false
+                    }
+                    if (!isShow && matchFound) {
+                        inputParam.display = false
+                    }
+                } else if (typeof comparisonValue === 'boolean' || typeof comparisonValue === 'number') {
+                    const matchFound = groundValue.includes(comparisonValue)
+                    if (isShow && !matchFound) {
+                        inputParam.display = false
+                    }
+                    if (!isShow && matchFound) {
+                        inputParam.display = false
+                    }
+                } else if (typeof comparisonValue === 'object' && comparisonValue !== null) {
+                    // Object comparison for array elements
+                    const matchFound = groundValue.some((val) => isEqual(comparisonValue, val))
+                    if (isShow && !matchFound) {
+                        inputParam.display = false
+                    }
+                    if (!isShow && matchFound) {
+                        inputParam.display = false
+                    }
+                }
+            } else {
+                if (Array.isArray(comparisonValue)) {
+                    if (isShow && !comparisonValue.includes(groundValue)) {
+                        inputParam.display = false
+                    }
+                    if (!isShow && comparisonValue.includes(groundValue)) {
+                        inputParam.display = false
+                    }
+                } else if (typeof comparisonValue === 'string') {
+                    if (isShow && comparisonValue !== groundValue) {
+                        inputParam.display = false
+                    }
+                    if (!isShow && comparisonValue === groundValue) {
+                        inputParam.display = false
+                    }
+                } else if (typeof comparisonValue === 'boolean') {
+                    if (isShow && comparisonValue !== groundValue) {
+                        inputParam.display = false
+                    }
+                    if (!isShow && comparisonValue === groundValue) {
+                        inputParam.display = false
+                    }
+                } else if (typeof comparisonValue === 'number') {
+                    if (isShow && comparisonValue !== groundValue) {
+                        inputParam.display = false
+                    }
+                    if (!isShow && comparisonValue === groundValue) {
+                        inputParam.display = false
+                    }
+                } else if (typeof comparisonValue === 'object' && comparisonValue !== null) {
+                    // Object comparison for non-array values
+                    const objectsAreEqual = isEqual(comparisonValue, groundValue)
+                    if (isShow && !objectsAreEqual) {
+                        inputParam.display = false
+                    }
+                    if (!isShow && objectsAreEqual) {
+                        inputParam.display = false
+                    }
+                }
+            }
+        })
+    }
+
+    /**
+     * Initialize node data similar to frontend's initNode function
+     * This creates the exact same structure as when dragging and dropping manually
+     */
+    private initNodeData(nodeTemplate: any, newNodeId: string, aiParams: Record<string, any>, isAgentflow: boolean): any {
+        const inputAnchors: any[] = []
+        const inputParams: any[] = []
+
+        const whitelistTypes = [
+            'asyncOptions',
+            'asyncMultiOptions',
+            'options',
+            'multiOptions',
+            'array',
+            'datagrid',
+            'string',
+            'number',
+            'boolean',
+            'password',
+            'json',
+            'code',
+            'date',
+            'file',
+            'folder',
+            'tabs',
+            'conditionFunction'
+        ]
+
+        // Process inputs - separate into inputAnchors and inputParams
+        if (nodeTemplate.inputs) {
+            for (const input of nodeTemplate.inputs) {
+                const newInput = {
+                    ...input,
+                    id: `${newNodeId}-input-${input.name}-${input.type}`
+                }
+                if (whitelistTypes.includes(input.type)) {
+                    inputParams.push(newInput)
+                } else {
+                    inputAnchors.push(newInput)
+                }
+            }
+
+            // Handle credential
+            if (nodeTemplate.credential) {
+                const newInput = {
+                    ...nodeTemplate.credential,
+                    id: `${newNodeId}-input-${nodeTemplate.credential.name}-${nodeTemplate.credential.type}`
+                }
+                inputParams.unshift(newInput)
+            }
+        }
+
+        // Initialize default values for inputs
+        const defaultInputs = this.initializeDefaultNodeData(nodeTemplate.inputs || [])
+
+        // Merge AI params on top of defaults
+        const mergedInputs = { ...defaultInputs }
+        for (const key in aiParams) {
+            mergedInputs[key] = aiParams[key]
+        }
+
+        // Initialize output anchors
+        const outputAnchors = this.initializeOutputAnchors(nodeTemplate, newNodeId, isAgentflow)
+
+        // Apply show/hide logic
+        const nodeWithInputs = {
+            ...nodeTemplate,
+            inputs: mergedInputs
+        }
+
+        const processedInputAnchors = this.applyShowHideLogic(nodeWithInputs, inputAnchors, mergedInputs)
+        const processedInputParams = this.applyShowHideLogic(nodeWithInputs, inputParams, mergedInputs)
+
+        // Build final node data
+        const nodeData: any = {
+            id: newNodeId,
+            name: nodeTemplate.name,
+            label: nodeTemplate.label,
+            type: nodeTemplate.type,
+            category: nodeTemplate.category,
+            baseClasses: nodeTemplate.baseClasses,
+            icon: nodeTemplate.icon,
+            color: nodeTemplate.color,
+            description: nodeTemplate.description,
+            inputs: mergedInputs,
+            inputAnchors: processedInputAnchors,
+            inputParams: processedInputParams,
+            outputAnchors: outputAnchors,
+            outputs: this.initializeDefaultNodeData(outputAnchors),
+            selected: false
+        }
+
+        // Handle credential
+        if (nodeTemplate.credential) {
+            nodeData.credential = ''
+        }
+
+        return nodeData
+    }
+
+    // ========================================================================
+    // Safe Flow Builder
+    // ========================================================================
+
+    /**
+     * Safely construct a flow from simplified AI output
+     */
+    private async constructFlow(simplifiedNodes: any[], simplifiedEdges: any[], flowType: string, idMap: Record<string, string>): Promise<any> {
+        let fullNodes: any[] = []
+        const fullEdges: any[] = []
+        // idMap is now passed by reference and persisted across calls
+
+        const normalizedFlowType = (flowType || 'chatflow').toLowerCase()
+        const reactFlowType = normalizedFlowType === 'agentflow' ? 'agentFlow' : 'customNode'
+
+        // 0. Pre-processing: Ensure Agentflow has Start Node
+        if (normalizedFlowType === 'agentflow') {
+            const hasStart = simplifiedNodes.some(n => n.type === 'Start' || n.label === 'Start')
+            if (!hasStart) {
+                // Only add start node if we haven't already (check using a stable pseudo-ID)
+                if (!idMap['start_auto']) {
+                    simplifiedNodes.unshift({
+                        id: 'start_auto',
+                        type: 'Start',
+                        label: 'Start',
+                        params: {}
+                    })
+                }
+            }
+        }
+        // 1. First pass: Assign UUIDs and Initialize Nodes using initNodeData (same as manual drag-drop)
+        for (const sNode of simplifiedNodes) {
+            try {
+                // Generate robust ID or reuse existing
+                if (!idMap[sNode.id]) {
+                    idMap[sNode.id] = `node_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+                }
+                const uuid = idMap[sNode.id]
+
+                // Fetch full node spec
+                const nodeTemplate = await nodesService.getNodeByName(sNode.type) as any
+
+                // Validate node template exists
+                if (!nodeTemplate) {
+                    logger.warn(`[constructFlow] Node type '${sNode.type}' not found, skipping node`)
+                    continue
+                }
+
+                // Use initNodeData to create the exact same structure as when dragging and dropping manually
+                // This ensures proper inputParams, inputAnchors, outputAnchors, and default values
+                const nodeData = this.initNodeData(nodeTemplate, uuid, sNode.params || {}, normalizedFlowType === 'agentflow')
+
+                // Override label if AI provided one
+                if (sNode.label) {
+                    nodeData.label = sNode.label
+                }
+
+                // Construct the node with ReactFlow structure
+                const node: any = {
+                    id: uuid,
+                    data: nodeData,
+                    type: reactFlowType, // 'agentFlow' or 'customNode'
+                    position: { x: 0, y: 0 }
+                }
+
+                // Sanitize Position
+                if (sNode.position && typeof sNode.position === 'object') {
+                    const x = parseFloat(sNode.position.x)
+                    const y = parseFloat(sNode.position.y)
+
+                    if (!isNaN(x) && !isNaN(y)) {
+                        node.position = { x, y }
+                        ;(node as any).manualLayout = true
+                    }
+                }
+
+                fullNodes.push(node)
+            } catch (e) {
+                logger.warn(`[SafeBuilder] Failed to hydrate node ${sNode.type}`, e)
+            }
+        }
+
+        // 2. Second pass: Construct Edges & Auto-Layout
+        let layoutX = 100
+        const layoutY = 200
+        const spacingX = 400
+
+        // Simple layout: Linear using topological sort approximation or just order
+        // For now: Linear
+
+        for (let i = 0; i < fullNodes.length; i++) {
+            if (!(fullNodes[i] as any).manualLayout) {
+                fullNodes[i].position = { x: layoutX, y: layoutY }
+                layoutX += spacingX
+            } else {
+                // If manual, we clean up the marker property before sending to client
+                delete (fullNodes[i] as any).manualLayout
+            }
+        }
+
+        for (const sEdge of simplifiedEdges) {
+            const sourceId = idMap[sEdge.source]
+            const targetId = idMap[sEdge.target]
+
+            if (sourceId && targetId) {
+                // Find source and target nodes to resolve handles
+                const sourceNode = fullNodes.find(n => n.id === sourceId)
+                const targetNode = fullNodes.find(n => n.id === targetId)
+
+                let sourceHandle = sEdge.sourceHandle
+                let targetHandle = sEdge.targetHandle
+
+                // For Agentflow v2: connections are from node ID to node ID (no handles)
+                if (normalizedFlowType === 'agentflow') {
+                    sourceHandle = sourceId
+                    targetHandle = targetId
+                } else {
+                    // For Chatflow: Validate and resolve handles
+
+                    // Validate Source Handle - find first matching output anchor
+                    if (sourceNode?.data?.outputAnchors) {
+                        const outputAnchors = sourceNode.data.outputAnchors
+
+                        // Handle options type (dropdown outputs)
+                        if (outputAnchors.length > 0 && outputAnchors[0].type === 'options') {
+                            const options = outputAnchors[0].options || []
+                            const exists = options.some((a: any) => a.id === sourceHandle)
+                            if (!exists) {
+                                if (options.length > 0) {
+                                    sourceHandle = options[0].id
+                                } else {
+                                    // No output options available - skip this edge
+                                    logger.warn(`[constructFlow] No output options available for node ${sourceId}, skipping edge`)
+                                    continue
+                                }
+                            }
+                        } else {
+                            // Handle direct output anchors
+                            const exists = outputAnchors.some((a: any) => a.id === sourceHandle)
+                            if (!exists) {
+                                if (outputAnchors.length > 0) {
+                                    sourceHandle = outputAnchors[0].id
+                                } else {
+                                    logger.warn(`[constructFlow] No output anchors available for node ${sourceId}, skipping edge`)
+                                    continue
+                                }
+                            }
+                        }
+                    }
+
+                    // Validate Target Handle
+                    if (targetNode?.data?.inputAnchors) {
+                        const exists = targetNode.data.inputAnchors.some((a: any) => a.id === targetHandle)
+                        if (!exists) {
+                            if (targetNode.data.inputAnchors.length > 0) {
+                                targetHandle = targetNode.data.inputAnchors[0].id
+                            } else {
+                                logger.warn(`[constructFlow] No input anchors available for node ${targetId}, skipping edge`)
+                                continue
+                            }
+                        }
+                    }
+                }
+
+                fullEdges.push({
+                    source: sourceId,
+                    sourceHandle: sourceHandle || null,
+                    target: targetId,
+                    targetHandle: targetHandle || null,
+                    type: normalizedFlowType === 'agentflow' ? 'agentFlow' : 'custom',
+                    id: `edge_${sourceId}_${targetId}`
+                })
+            }
+        }
+
+        return {
+            nodes: fullNodes,
+            edges: fullEdges,
+            viewport: { x: 0, y: 0, zoom: 1 },
+            __hydrated: true
+        }
+    }
     /**
      * Chat with memory and streaming
      */
@@ -318,33 +825,260 @@ class LangChainService {
         try {
             logger.info('[LangChainService] Chat with memory and streaming', {
                 model: request.model,
-                conversationId
+                conversationId,
+                flowType: request.flowType
             })
 
             const history = await historyStore.getHistory(conversationId)
             const userMessage = request.messages[request.messages.length - 1]
 
-            // Add user message to history
-            await history.addMessage(new HumanMessage(userMessage.content))
-
-            // Get all messages and stream LLM response
-            const historyMessages = await history.getMessages()
-            const llm = this.createChatInstance(request.model, request.temperature)
-            const stream = await llm.stream(historyMessages)
-
-            let fullResponse = ''
-            for await (const chunk of stream) {
-                const content = chunk.content.toString()
-                if (content) {
-                    fullResponse += content
-                    onChunk(content)
+            // 1. Tool Definitions
+            const getNodeDetailsTool = {
+                type: 'function',
+                function: {
+                    name: 'get_node_details',
+                    description: 'Get detailed specific inputs, parameters, and description of a specific node by its name.',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            nodeName: {
+                                type: 'string',
+                                description: 'The exact name of the node to look up (e.g. "chatOpenAI", "bufferMemory")'
+                            }
+                        },
+                        required: ['nodeName']
+                    }
                 }
             }
 
-            // Add AI response to history
-            await history.addMessage(new AIMessage(fullResponse))
+            const addNodeTool = {
+                type: 'function',
+                function: {
+                    name: 'add_node',
+                    description: 'Simulates dragging and dropping a node onto the canvas.',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            id: { type: 'string', description: 'Unique ID for this node (e.g. "node1", "agent1")' },
+                            type: { type: 'string', description: 'Node name from Available Nodes (e.g. "chatOpenAI", "mcpTool")' },
+                            params: { type: 'object', description: 'Input parameters for the node' },
+                            label: { type: 'string', description: 'Display name for the node' },
+                            position: {
+                                type: 'object',
+                                description: 'Optional: Drop position {x, y}. If omitted, auto-layout will be used.',
+                                properties: {
+                                    x: { type: 'number' },
+                                    y: { type: 'number' }
+                                }
+                            }
+                        },
+                        required: ['id', 'type']
+                    }
+                }
+            }
 
-            onComplete(fullResponse)
+            const connectNodesTool = {
+                type: 'function',
+                function: {
+                    name: 'connect_nodes',
+                    description: 'Simulates connecting two nodes with a wire on the canvas.',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            source: { type: 'string', description: 'Source node ID' },
+                            target: { type: 'string', description: 'Target node ID' },
+                            sourceHandle: { type: 'string' },
+                            targetHandle: { type: 'string' }
+                        },
+                        required: ['source', 'target']
+                    }
+                }
+            }
+
+            const finishFlowTool = {
+                type: 'function',
+                function: {
+                    name: 'finish_flow',
+                    description: 'Simulates clicking the Save button to persist the flow and render it.',
+                    parameters: {
+                        type: 'object',
+                        properties: {},
+                        required: []
+                    }
+                }
+            }
+
+            const tools = [getNodeDetailsTool, addNodeTool, connectNodesTool, finishFlowTool]
+
+            // Inject available nodes into system prompt (Static high-level list)
+            let systemContextMessages: BaseMessage[] = []
+            if (request.flowType) {
+                try {
+                    const normalizedFlowType = (request.flowType || 'chatflow').toLowerCase()
+                    const filteredNodes = await nodesService.getAllNodes({ flowType: normalizedFlowType })
+
+                    // Group for display
+                    const grouped: Record<string, string[]> = {}
+                    for (const node of filteredNodes) {
+                        if (!grouped[node.category]) grouped[node.category] = []
+                        grouped[node.category].push(`- ${node.label} (Name: ${node.name}): ${node.description}`)
+                    }
+
+                    let nodesList = ''
+                    for (const [cat, items] of Object.entries(grouped)) {
+                        nodesList += `\n> ${cat}:\n${items.join('\n')}\n`
+                    }
+
+                    let systemPrompt = `You are a helpful assistant for building Flowise flows.
+Current context: ${normalizedFlowType === 'agentflow' ? 'Agentflow (Multi-Agent System)' : 'Chatflow (Standard Chatbot)'}.
+
+AVAILABLE NODES (Reference):
+${nodesList}
+
+
+1. To understand a node's specific inputs (required params, options), use 'get_node_details(nodeName)'.
+2. Do NOT guess inputs. Always check details for complex nodes.
+3. SIMULATE USER ACTIONS to build the flow:
+   - "Drag & Drop": Call 'add_node' for each node (you can provide optional x,y coordinates).
+   - "Connect": Call 'connect_nodes' to wire them up.
+   - "Save": FINALLY call 'finish_flow' to render the result.
+4. 'finish_flow' will handle layout and UUID generation.
+5. If the user just wants to chat, just reply with text.
+
+IMPORTANT:
+- Agentflow: Must start with 'Start' node (search for 'Start' node).
+- Agentflow: Use 'Agent', 'Tool', 'Chat Model' nodes. NO Chains.
+`
+                    systemContextMessages.push(new SystemMessage(systemPrompt))
+                } catch (e) {
+                    logger.error('[LangChainService] Failed to generate system prompt', e)
+                }
+            }
+
+            // Add user message to history
+            await history.addMessage(new HumanMessage(userMessage.content))
+            const historyMessages = await history.getMessages()
+
+            // Safe Builder Reminder
+            const reminderMessage = new SystemMessage("REMINDER: Simulate user actions: Drag nodes (add_node) -> Connect them (connect_nodes) -> Save (finish_flow).")
+
+            let currentMessages = [...systemContextMessages, ...historyMessages, reminderMessage]
+
+            // 2. Loop Execution (Manual Agent Loop)
+            const MAX_ITERATIONS = 25
+            const llm = this.createChatInstance(request.model, request.temperature).bindTools(tools)
+
+            let finalResponseText = ''
+            const accumulatedNodes: any[] = []
+            const accumulatedEdges: any[] = []
+            const idMap: Record<string, string> = {} // Consistent IDs across iterations
+
+            for (let i = 0; i < MAX_ITERATIONS; i++) {
+                // Call LLM
+                const response = await llm.invoke(currentMessages)
+
+                // Append AI response to messages context
+                currentMessages.push(response)
+
+                const toolCalls = response.tool_calls
+
+                if (toolCalls && toolCalls.length > 0) {
+                    // Handle Tool Calls
+                    for (const toolCall of toolCalls) {
+                        let toolResult = ''
+
+                        if (toolCall.name === 'get_node_details') {
+                            const { nodeName } = toolCall.args
+                            onChunk(`\n*Checking node details for: ${nodeName}...*\n`)
+                            try {
+                                const node = await nodesService.getNodeByName(nodeName)
+                                const slimNode = {
+                                    name: node.name,
+                                    label: node.label,
+                                    inputs: node.inputs,
+                                    category: node.category,
+                                    description: node.description
+                                }
+                                toolResult = JSON.stringify(slimNode)
+                            } catch (error) {
+                                toolResult = `Error: Node '${nodeName}' not found.`
+                            }
+                        } else if (toolCall.name === 'add_node') {
+                            const nodeData = toolCall.args
+                            accumulatedNodes.push(nodeData)
+                            onChunk(`\n*Added node: ${nodeData.label || nodeData.type}*\n`)
+
+                            // Incremental Render
+                            try {
+                                const flowData = await this.constructFlow(accumulatedNodes, accumulatedEdges, request.flowType || 'chatflow', idMap)
+                                const jsonBlock = `\`\`\`json\n${JSON.stringify(flowData, null, 2)}\n\`\`\`\n`
+                                onChunk(jsonBlock)
+                                toolResult = `Node '${nodeData.id}' added and rendered.`
+                            } catch (e: any) {
+                                toolResult = `Node added but render failed: ${e.message}`
+                            }
+
+                        } else if (toolCall.name === 'connect_nodes') {
+                            const edgeData = toolCall.args
+                            accumulatedEdges.push(edgeData)
+                            onChunk(`\n*Connected: ${edgeData.source} -> ${edgeData.target}*\n`)
+
+                            // Incremental Render
+                            try {
+                                const flowData = await this.constructFlow(accumulatedNodes, accumulatedEdges, request.flowType || 'chatflow', idMap)
+                                const jsonBlock = `\`\`\`json\n${JSON.stringify(flowData, null, 2)}\n\`\`\`\n`
+                                onChunk(jsonBlock)
+                                toolResult = 'Connection recorded and rendered.'
+                            } catch (e: any) {
+                                toolResult = `Connection recorded but render failed: ${e.message}`
+                            }
+
+                        } else if (toolCall.name === 'finish_flow') {
+                            onChunk(`\n*Finalizing flow...*\n`)
+
+                            try {
+                                // Final Render
+                                const flowData = await this.constructFlow(accumulatedNodes, accumulatedEdges, request.flowType || 'chatflow', idMap)
+
+                                const jsonBlock = `\`\`\`json
+${JSON.stringify(flowData, null, 2)}
+\`\`\`
+`
+                                finalResponseText += jsonBlock
+                                onChunk(jsonBlock)
+                                toolResult = 'Flow generated successfully.'
+
+                                // End the loop
+                                i = MAX_ITERATIONS
+                            } catch (e: any) {
+                                logger.error('[LangChainService] Error constructing flow', e)
+                                toolResult = `Error constructing flow: ${e.message}`
+                                onChunk(`\n*Error: ${e.message}*\n`)
+                            }
+                        }
+
+                        currentMessages.push({
+                            role: 'tool',
+                            tool_call_id: toolCall.id,
+                            content: toolResult,
+                            name: toolCall.name
+                        } as any)
+                    }
+                } else {
+                    // Normal text response
+                    const content = response.content.toString()
+                    finalResponseText += content
+                    onChunk(content)
+                    break // Stop loop if no tool calls
+                }
+            }
+
+            // Save final valid response to history
+            await history.addMessage(new AIMessage(finalResponseText))
+
+            onComplete(finalResponseText)
+
+
         } catch (error: any) {
             logger.error('[LangChainService] Chat with memory streaming failed', {
                 error: error.message,
@@ -520,6 +1254,49 @@ class LangChainService {
                 const history = await historyStore.getHistory(conversationId)
                 const messages = await history.getMessages()
 
+                // Helper to deduplicate messages
+                const cleanMessages = (msgs: BaseMessage[]) => {
+                    const cleaned: BaseMessage[] = []
+
+                    // 1. Remove adjacent duplicates
+                    for (let i = 0; i < msgs.length; i++) {
+                        const current = msgs[i]
+                        const prev = cleaned[cleaned.length - 1]
+
+                        if (prev &&
+                            prev.content.toString() === current.content.toString() &&
+                            prev.constructor.name === current.constructor.name) {
+                            continue
+                        }
+                        cleaned.push(current)
+                    }
+
+                    // 2. Check for full history duplication (A, B, C, A, B, C)
+                    // Only check if we have even number of messages and length > 2
+                    if (cleaned.length > 2 && cleaned.length % 2 === 0) {
+                        const mid = cleaned.length / 2
+                        const firstHalf = cleaned.slice(0, mid)
+                        const secondHalf = cleaned.slice(mid)
+
+                        let isExactDup = true
+                        for (let i = 0; i < mid; i++) {
+                            if (firstHalf[i].content.toString() !== secondHalf[i].content.toString() ||
+                                firstHalf[i].constructor.name !== secondHalf[i].constructor.name) {
+                                isExactDup = false
+                                break
+                            }
+                        }
+
+                        if (isExactDup) {
+                            return firstHalf
+                        }
+                    }
+
+                    return cleaned
+                }
+
+                const uniqueMessages = cleanMessages(messages)
+
                 return {
                     conversationId,
                     flowId: conversationData?.flowId,
@@ -527,10 +1304,11 @@ class LangChainService {
                     title: conversationData?.title,
                     createdAt: conversationData?.createdAt,
                     updatedAt: conversationData?.updatedAt,
-                    messages: messages.map((msg) => ({
+                    messages: uniqueMessages.map((msg, index) => ({
                         role: msg.constructor.name.toLowerCase().replace('message', ''),
                         content: msg.content.toString(),
-                        timestamp: new Date() // LangChain doesn't store timestamp
+                        timestamp: new Date(), // LangChain doesn't store timestamp
+                        id: `${conversationId}_${index}` // Stable ID creation
                     }))
                 }
             }
@@ -541,10 +1319,11 @@ class LangChainService {
 
             return {
                 conversationId,
-                messages: messages.map((msg) => ({
+                messages: messages.map((msg, index) => ({
                     role: msg.constructor.name.toLowerCase().replace('message', ''),
                     content: msg.content.toString(),
-                    timestamp: new Date()
+                    timestamp: new Date(),
+                    id: `${conversationId}_${index}`
                 }))
             }
         } catch (error: any) {

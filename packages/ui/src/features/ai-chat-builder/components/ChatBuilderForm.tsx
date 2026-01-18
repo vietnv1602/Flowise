@@ -70,8 +70,13 @@ export const ChatBuilderForm: React.FC<ChatBuilderFormProps> = ({
                     )
                     setAllModels(models)
 
-                    // Select first model by default
-                    if (models.length > 0) {
+                    // Select default model
+                    const defaultModelId = 'gpt-oss:20b'
+                    const defaultModel = models.find((m) => m.id === defaultModelId)
+
+                    if (defaultModel) {
+                        setSelectedModel(defaultModelId)
+                    } else if (models.length > 0) {
                         setSelectedModel(models[0].id)
                     }
                 }

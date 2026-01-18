@@ -164,15 +164,15 @@ export function useChatBuilder({
                     }
                 }))
 
-                enqueueSnackbar('Response received', {
-                    variant: 'success'
-                })
+                // enqueueSnackbar('Response received', {
+                //     variant: 'success'
+                // })
 
                 return {
                     flowData: { nodes: [], edges: [], viewport: { x: 0, y: 0, zoom: 1 } },
                     metadata: {
                         provider: request.selectedProvider || 'llmhub',
-                        model: request.model || 'gpt-4o-mini',
+                        model: request.model || 'gpt-oss:20b',
                         tokensUsed: fullResponse.length,
                         timestamp: new Date(),
                         version: '1.0.0'
@@ -340,9 +340,54 @@ export function useChatBuilder({
                     }
                 )
 
+                // Check if response contains flow JSON
+                let flowData = null
+                // Match ```json ... ``` blocks, allowing for flexible whitespace/newlines
+                const jsonMatch = fullResponse.match(/```json\s*([{[\s\S]*?})\s*```/)
+
+                if (jsonMatch && jsonMatch[1]) {
+                    try {
+                        const rawJson = jsonMatch[1].trim()
+                        // Strip comments (// and /* */) while preserving strings (e.g. urls)
+                        const sanitizedJson = rawJson.replace(/\\"|"(?:\\"|[^"])*"|(\/\/.*|\/\*[\s\S]*?\*\/)/g, (m, c) => c ? '' : m)
+                        flowData = JSON.parse(sanitizedJson)
+
+                        // Sanitize: Ensure nodes have position and data to prevent crashes
+                        if (flowData && Array.isArray(flowData.nodes)) {
+                            // Check for hydration to detect hallucinations
+                            if (!flowData.__hydrated) {
+                                console.warn('[ChatBuilder] Flow JSON lacks hydration marker. This may be a hallucination.')
+                                // We still sanitize and attempt show it, but it might be broken.
+                            }
+
+                            flowData.nodes = flowData.nodes.map((node: any) => ({
+                                ...node,
+                                position: node.position || { x: 0, y: 0 },
+                                data: node.data || { label: node.label || node.id || 'Node' },
+                                type: node.type || 'customNode'
+                            }))
+                        }
+                    } catch (e) {
+                        console.error('Failed to parse generated flow JSON', e)
+                        console.log('Raw JSON string:', jsonMatch[1])
+                    }
+                }
+
                 setState((prev) => ({
                     ...prev,
                     isGenerating: false,
+                    result: flowData ? {
+                        flowData,
+                        metadata: {
+                            provider: (model || 'openai') as any,
+                            model: model,
+                            tokensUsed: fullResponse.length,
+                            timestamp: new Date(),
+                            version: '1.0.0'
+                        },
+                        nodes: flowData.nodes || [],
+                        edges: flowData.edges || []
+                    } : null,
                     progress: {
                         stage: 'complete',
                         currentStep: 1,
@@ -351,7 +396,7 @@ export function useChatBuilder({
                     }
                 }))
 
-                enqueueSnackbar('Response received', { variant: 'success' })
+                // enqueueSnackbar('Response received', { variant: 'success' })
             } catch (error: any) {
                 const errorMessage = error.message || 'Failed to get response'
 
